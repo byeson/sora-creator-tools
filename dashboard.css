@@ -1058,8 +1058,67 @@ body.is-resizing{cursor:col-resize;user-select:none}
   gap:8px;
   flex-wrap:wrap;
 }
+.remix-network-controls{
+  gap:6px;
+}
+.remix-network-controls button{
+  white-space:nowrap;
+}
+.network-owner-filter{
+  min-width:170px;
+  max-width:220px;
+  padding:7px 10px;
+  border-radius:999px;
+  background:rgba(var(--panel-mid-rgb),0.72);
+  border:1px solid rgba(255,255,255,0.16);
+  color:var(--fg);
+  font-size:12px;
+  font-weight:600;
+}
 .chart-wrap + .chart-title{
   margin-top:38px;
+}
+.remix-remixers-meta{
+  margin:0 0 10px;
+  color:var(--muted);
+  font-size:12px;
+  font-family:var(--font-system);
+}
+.remix-remixers-block .chart-header{
+  gap:12px;
+}
+.remix-remixers-card{
+  border:1px solid rgba(255,255,255,0.1);
+  border-radius:14px;
+  background:linear-gradient(160deg, rgba(var(--surface-rgb),0.8), rgba(var(--bg-alt-rgb),0.85));
+  padding:10px 12px;
+}
+.remix-remixers-table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:12px;
+  font-family:var(--font-system);
+}
+.remix-remixers-table th,
+.remix-remixers-table td{
+  padding:6px 4px;
+  border-bottom:1px solid rgba(255,255,255,0.08);
+  text-align:left;
+}
+.remix-remixers-table th{
+  color:rgba(255,255,255,0.72);
+  font-weight:600;
+  letter-spacing:0.04em;
+}
+.remix-remixers-table td{
+  color:rgba(236,243,248,0.92);
+}
+.remix-remixers-table td:last-child,
+.remix-remixers-table th:last-child{
+  text-align:right;
+}
+.remix-remixers-table tr:last-child td{
+  border-bottom:0;
 }
 .section-note,
 .best-time-subtitle{

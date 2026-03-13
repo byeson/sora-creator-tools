@@ -22,6 +22,8 @@
   const USABLE_THUMB_URLS_STORAGE_KEY = 'SCT_USABLE_THUMB_URLS_V1';
   const MAX_EXPIRED_THUMB_URLS = 2000;
   const MAX_USABLE_THUMB_URLS = 4000;
+  const NETWORK_GRAPH_DEFAULT_MAX_NODES = 1200;
+  const NETWORK_GRAPH_DEFAULT_MAX_EDGES = 2500;
   const BLOCKED_THUMB_HOSTS = new Set(['ogimg.chatgpt.com']);
   const CUSTOM_FILTER_PREFIX = 'custom:';
   const absUrl = (u, pid) => {
@@ -352,6 +354,11 @@
   const BEST_TIME_PREFS_KEY = 'SCT_DASHBOARD_BEST_TIME_PREFS_V1';
   const VIEWS_TYPE_STORAGE_KEY = 'SCT_DASHBOARD_VIEWS_TYPE_V1';
   const CHART_MODE_STORAGE_KEY = 'SCT_DASHBOARD_CHART_MODE_V1';
+  const NETWORK_PREFS_STORAGE_KEY = 'SCT_NETWORK_PREFS_V1';
+  const NETWORK_MODE_DEFAULT = 'visible';
+  const NETWORK_SIZE_METRIC_DEFAULT = 'remixes';
+  const NETWORK_LABEL_DENSITY_DEFAULT = 'sparse';
+  const NETWORK_OWNER_FILTER_DEFAULT = 'all';
   const STACKED_WINDOW_STORAGE_KEYS = {
     interaction: 'SCT_DASHBOARD_STACKED_WINDOW_INTERACTION_V1',
     views: 'SCT_DASHBOARD_STACKED_WINDOW_VIEWS_V1',
@@ -1063,6 +1070,66 @@
     if (!normalized) return;
     try { localStorage.setItem(key, normalized); } catch {}
     try { chrome.storage.local.set({ [key]: normalized }); } catch {}
+  }
+
+  function normalizeNetworkMode(raw){
+    return raw === 'visible' || raw === 'all' ? raw : null;
+  }
+
+  function normalizeNetworkSizeMetric(raw){
+    return raw === 'remixes' || raw === 'likes' || raw === 'views' ? raw : null;
+  }
+
+  function normalizeNetworkLabelDensity(raw){
+    return raw === 'off' || raw === 'sparse' || raw === 'all' ? raw : null;
+  }
+
+  function normalizeNetworkOwnerFilter(raw){
+    if (raw === 'all' || raw === 'selected') return raw;
+    if (typeof raw !== 'string') return null;
+    const value = raw.trim().toLowerCase();
+    if (!value) return null;
+    if (value === 'all' || value === 'selected') return value;
+    if (value.startsWith('user:') && value.length > 5 && value.length <= 96) return value;
+    return null;
+  }
+
+  function normalizeNetworkPrefs(raw){
+    if (!raw || typeof raw !== 'object') return null;
+    const out = {};
+    const mode = normalizeNetworkMode(raw.mode);
+    const sizeMetric = normalizeNetworkSizeMetric(raw.sizeMetric);
+    const labelDensity = normalizeNetworkLabelDensity(raw.labelDensity);
+    const ownerFilter = normalizeNetworkOwnerFilter(raw.ownerFilter);
+    if (mode) out.mode = mode;
+    if (sizeMetric) out.sizeMetric = sizeMetric;
+    if (labelDensity) out.labelDensity = labelDensity;
+    if (ownerFilter) out.ownerFilter = ownerFilter;
+    return Object.keys(out).length ? out : null;
+  }
+
+  function loadNetworkPrefs(){
+    try {
+      const raw = localStorage.getItem(NETWORK_PREFS_STORAGE_KEY);
+      if (!raw) return null;
+      return normalizeNetworkPrefs(JSON.parse(raw));
+    } catch {
+      return null;
+    }
+  }
+
+  function saveNetworkPrefs(prefs){
+    const normalized = normalizeNetworkPrefs(prefs);
+    if (!normalized) return;
+    const payload = {
+      mode: normalized.mode || NETWORK_MODE_DEFAULT,
+      sizeMetric: normalized.sizeMetric || NETWORK_SIZE_METRIC_DEFAULT,
+      labelDensity: normalized.labelDensity || NETWORK_LABEL_DENSITY_DEFAULT,
+      ownerFilter: normalized.ownerFilter || NETWORK_OWNER_FILTER_DEFAULT,
+      savedAt: Date.now()
+    };
+    try { localStorage.setItem(NETWORK_PREFS_STORAGE_KEY, JSON.stringify(payload)); } catch {}
+    try { chrome.storage.local.set({ [NETWORK_PREFS_STORAGE_KEY]: payload }); } catch {}
   }
 
   function resolveLegacyChartMode(legacyModes){
@@ -3187,6 +3254,278 @@
     const clean = (typeof text === 'string' ? text.trim() : '') || 'this post';
     if (clean.length <= 100) return clean;
     return clean.slice(0, 100) + '...';
+  }
+
+  function buildRemixNetworkForUser(user, visibleSet, opts = {}){
+    const posts = (user && user.posts && typeof user.posts === 'object') ? user.posts : {};
+    const mode = opts?.mode === 'all' ? 'all' : 'visible';
+    const resolvePostById = typeof opts?.resolvePostById === 'function' ? opts.resolvePostById : null;
+    const maxNodesRaw = Number(opts?.maxNodes);
+    const maxEdgesRaw = Number(opts?.maxEdges);
+    const maxNodes = Number.isFinite(maxNodesRaw) && maxNodesRaw > 0
+      ? Math.floor(maxNodesRaw)
+      : NETWORK_GRAPH_DEFAULT_MAX_NODES;
+    const maxEdges = Number.isFinite(maxEdgesRaw) && maxEdgesRaw > 0
+      ? Math.floor(maxEdgesRaw)
+      : NETWORK_GRAPH_DEFAULT_MAX_EDGES;
+    const postIds = Object.keys(posts);
+    const selectedIds = postIds.filter((pid)=>{
+      if (mode === 'all') return true;
+      if (!visibleSet || typeof visibleSet.has !== 'function') return false;
+      return visibleSet.has(pid);
+    });
+    const selectedIdSet = new Set(selectedIds);
+    const nodeMap = new Map();
+    const edgeMap = new Map();
+
+    const latestForPost = (post)=>{
+      const snaps = Array.isArray(post?.snapshots) ? post.snapshots : [];
+      if (!snaps.length) return null;
+      const last = snaps[snaps.length - 1];
+      if (last?.t != null) return last;
+      let best = null;
+      let bestTs = -Infinity;
+      for (const snap of snaps) {
+        const ts = Number(snap?.t);
+        if (Number.isFinite(ts) && ts > bestTs) {
+          best = snap;
+          bestTs = ts;
+        }
+      }
+      return best || last || null;
+    };
+    const toNumOrNull = (v)=>{
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const normalizeRemixIds = (value)=>{
+      if (!Array.isArray(value)) return [];
+      const out = [];
+      const seen = new Set();
+      for (const raw of value) {
+        if (typeof raw !== 'string') continue;
+        const id = raw.trim();
+        if (!id) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(id);
+      }
+      return out;
+    };
+    const ensureNode = (id)=>{
+      if (!id || typeof id !== 'string') return null;
+      if (nodeMap.has(id)) return nodeMap.get(id);
+      const resolved = resolvePostById ? resolvePostById(id) : null;
+      const post = resolved?.post || posts[id] || null;
+      const latest = latestForPost(post);
+      const caption = typeof post?.caption === 'string' ? post.caption.trim() : '';
+      const label = caption || id;
+      const owner = resolved?.ownerHandle
+        || post?.ownerHandle
+        || post?.userHandle
+        || (posts[id] ? (user?.handle || null) : null);
+      const node = {
+        id,
+        label,
+        owner,
+        url: absUrl(post?.url, id),
+        views: toNumOrNull(latest?.views),
+        likes: toNumOrNull(latest?.likes),
+        remixes: toNumOrNull(latest?.remix_count ?? latest?.remixes),
+        comments: toNumOrNull(latest?.comments ?? latest?.reply_count),
+        isPlaceholder: !post,
+        isVisible: selectedIdSet.has(id),
+        inDegree: 0,
+        outDegree: 0,
+        depth: null
+      };
+      nodeMap.set(id, node);
+      return node;
+    };
+    const addEdge = (sourceId, targetId, inferred)=>{
+      if (typeof sourceId !== 'string' || typeof targetId !== 'string') return;
+      const source = sourceId.trim();
+      const target = targetId.trim();
+      if (!source || !target || source === target) return;
+      const sourceNode = ensureNode(source);
+      const targetNode = ensureNode(target);
+      if (!sourceNode || !targetNode) return;
+      const key = `${source}=>${target}`;
+      const existing = edgeMap.get(key);
+      if (existing) {
+        if (existing.inferred && !inferred) existing.inferred = false;
+        return;
+      }
+      edgeMap.set(key, { sourceId: source, targetId: target, inferred: !!inferred });
+    };
+
+    for (const parentId of selectedIds) {
+      ensureNode(parentId);
+      const post = posts[parentId];
+      const remixIds = normalizeRemixIds(post?.remix_post_ids);
+      for (const childId of remixIds) addEdge(parentId, childId, false);
+    }
+    for (const childId of selectedIds) {
+      const post = posts[childId];
+      const parentId = typeof post?.parent_post_id === 'string' ? post.parent_post_id.trim() : '';
+      if (parentId) addEdge(parentId, childId, true);
+    }
+
+    let nodes = Array.from(nodeMap.values());
+    let edges = Array.from(edgeMap.values());
+    const originalNodeCount = nodes.length;
+    const originalEdgeCount = edges.length;
+
+    if (nodes.length > maxNodes) {
+      nodes.sort((a, b)=>{
+        const aPriority = a.isVisible ? 0 : a.isPlaceholder ? 2 : 1;
+        const bPriority = b.isVisible ? 0 : b.isPlaceholder ? 2 : 1;
+        if (aPriority !== bPriority) return aPriority - bPriority;
+        return String(a.id).localeCompare(String(b.id));
+      });
+      nodes = nodes.slice(0, maxNodes);
+      const keep = new Set(nodes.map(n => n.id));
+      edges = edges.filter(e => keep.has(e.sourceId) && keep.has(e.targetId));
+    }
+    if (edges.length > maxEdges) {
+      edges.sort((a, b)=>{
+        const s = String(a.sourceId).localeCompare(String(b.sourceId));
+        if (s !== 0) return s;
+        const t = String(a.targetId).localeCompare(String(b.targetId));
+        if (t !== 0) return t;
+        return Number(a.inferred) - Number(b.inferred);
+      });
+      edges = edges.slice(0, maxEdges);
+    }
+
+    const nodeIndex = new Map();
+    for (const node of nodes) {
+      node.inDegree = 0;
+      node.outDegree = 0;
+      node.depth = null;
+      nodeIndex.set(node.id, node);
+    }
+    const adjacency = new Map();
+    for (const edge of edges) {
+      const src = nodeIndex.get(edge.sourceId);
+      const dst = nodeIndex.get(edge.targetId);
+      if (!src || !dst) continue;
+      src.outDegree += 1;
+      dst.inDegree += 1;
+      if (!adjacency.has(src.id)) adjacency.set(src.id, []);
+      adjacency.get(src.id).push(dst.id);
+    }
+    for (const list of adjacency.values()) list.sort((a, b)=>String(a).localeCompare(String(b)));
+
+    const queue = [];
+    const rootIds = nodes
+      .filter(n => n.inDegree === 0)
+      .map(n => n.id)
+      .sort((a, b)=>String(a).localeCompare(String(b)));
+    for (const rootId of rootIds) {
+      const rootNode = nodeIndex.get(rootId);
+      if (!rootNode) continue;
+      rootNode.depth = 0;
+      queue.push(rootId);
+    }
+    while (queue.length) {
+      const currentId = queue.shift();
+      const current = nodeIndex.get(currentId);
+      if (!current) continue;
+      const children = adjacency.get(currentId) || [];
+      for (const childId of children) {
+        const child = nodeIndex.get(childId);
+        if (!child) continue;
+        const nextDepth = (current.depth == null ? 0 : current.depth) + 1;
+        if (child.depth == null || nextDepth < child.depth) {
+          child.depth = nextDepth;
+          queue.push(childId);
+        }
+      }
+    }
+    for (const node of nodes) {
+      if (node.depth == null) node.depth = 0;
+    }
+    nodes.sort((a, b)=>{
+      const d = (a.depth || 0) - (b.depth || 0);
+      if (d !== 0) return d;
+      const pa = a.isPlaceholder ? 1 : 0;
+      const pb = b.isPlaceholder ? 1 : 0;
+      if (pa !== pb) return pa - pb;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+    return {
+      mode,
+      nodes,
+      edges,
+      meta: {
+        selectedPosts: selectedIds.length,
+        nodeCount: nodes.length,
+        edgeCount: edges.length,
+        truncatedNodes: Math.max(0, originalNodeCount - nodes.length),
+        truncatedEdges: Math.max(0, originalEdgeCount - edges.length)
+      }
+    };
+  }
+
+  function computeRemixNetworkInsights(graph, user, opts = {}){
+    const filteredGraph = opts?.filteredGraph || graph || { nodes: [], edges: [] };
+    const formatOwner = typeof formatNetworkOwnerLabel === 'function'
+      ? formatNetworkOwnerLabel
+      : (ownerKey)=>String(ownerKey || '');
+    const selectedOwner = normalizeCameoName(user?.handle || '');
+    const requestedSourceOwner = normalizeCameoName(opts?.sourceOwnerKey || '');
+    const aggregateAllSources = requestedSourceOwner === '*'
+      || (!requestedSourceOwner && typeof user?.__specialKey === 'string' && !!user.__specialKey);
+    const activeSourceOwner = requestedSourceOwner || selectedOwner;
+    const nodeById = new Map((graph?.nodes || []).map((node)=>[node.id, node]));
+    const remixerMap = new Map();
+    let directRemixEdges = 0;
+    for (const edge of (graph?.edges || [])) {
+      const source = nodeById.get(edge.sourceId);
+      const target = nodeById.get(edge.targetId);
+      if (!source || !target || source.isPlaceholder || target.isPlaceholder) continue;
+      const sourceOwner = normalizeCameoName(source.owner || '');
+      const targetOwner = normalizeCameoName(target.owner || '');
+      if (!targetOwner) continue;
+      if (aggregateAllSources) {
+        if (!sourceOwner || targetOwner === sourceOwner) continue;
+      } else {
+        if (!activeSourceOwner || sourceOwner !== activeSourceOwner || targetOwner === activeSourceOwner) continue;
+      }
+      const prev = remixerMap.get(targetOwner) || { ownerKey: targetOwner, count: 0 };
+      prev.count += 1;
+      remixerMap.set(targetOwner, prev);
+      directRemixEdges += 1;
+    }
+    const topRemixers = Array.from(remixerMap.values()).sort((a, b)=> (b.count - a.count) || a.ownerKey.localeCompare(b.ownerKey));
+    const topLabel = topRemixers[0] ? `${formatOwner(topRemixers[0].ownerKey)} (${fmt(topRemixers[0].count)})` : 'n/a';
+    return {
+      statsRows: [
+        ['Filtered Nodes', fmt((filteredGraph?.nodes || []).length)],
+        ['Filtered Edges', fmt((filteredGraph?.edges || []).length)],
+        ['Unique Remixers', fmt(topRemixers.length)],
+        ['Direct Remix Edges', fmt(directRemixEdges)],
+        ['Top Remixer', topLabel]
+      ],
+      topRemixers
+    };
+  }
+
+  function collectRemixSourceOwners(graph){
+    const nodeById = new Map((graph?.nodes || []).map((node)=>[node.id, node]));
+    const counts = new Map();
+    for (const edge of (graph?.edges || [])) {
+      const source = nodeById.get(edge.sourceId);
+      const target = nodeById.get(edge.targetId);
+      if (!source || !target || source.isPlaceholder || target.isPlaceholder) continue;
+      const sourceOwner = normalizeCameoName(source.owner || '');
+      const targetOwner = normalizeCameoName(target.owner || '');
+      if (!sourceOwner || !targetOwner || sourceOwner === targetOwner) continue;
+      counts.set(sourceOwner, (counts.get(sourceOwner) || 0) + 1);
+    }
+    return Array.from(counts.entries()).sort((a, b)=> (b[1] - a[1]) || a[0].localeCompare(b[0]));
   }
 
   function getInitialSidebarWidth(viewportWidth = window.innerWidth){
@@ -6059,6 +6398,499 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
 
   // Legend removed — left list serves as legend
 
+  function makeRemixNetworkChart(canvas, tooltipSelector = '#remixNetworkTooltip'){
+    const noop = {
+      setGraph(){},
+      setOptions(){},
+      setHighlight(){},
+      setSelection(){},
+      resetView(){},
+      centerSelection(){},
+      onHover(){},
+      onSelect(){}
+    };
+    if (!canvas || typeof canvas.getContext !== 'function') return noop;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return noop;
+    const DPR = Math.max(1, window.devicePixelRatio || 1);
+    const tooltip = $(tooltipSelector);
+    const state = {
+      graph: { nodes: [], edges: [] },
+      nodeById: new Map(),
+      outAdj: new Map(),
+      inAdj: new Map(),
+      radii: new Map(),
+      transform: { x: 0, y: 0, k: 1 },
+      bounds: null,
+      hoverId: null,
+      highlightId: null,
+      selectionId: null,
+      options: {
+        sizeMetric: NETWORK_SIZE_METRIC_DEFAULT,
+        labelDensity: NETWORK_LABEL_DENSITY_DEFAULT,
+        colorForNode: null
+      }
+    };
+    let W = 1;
+    let H = 1;
+    let rafPending = false;
+    let hoverCb = null;
+    let selectCb = null;
+    let pan = null;
+
+    function pointFromEvent(e){
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (e.clientX - rect.left) * (canvas.width / Math.max(1, rect.width)) / DPR,
+        y: (e.clientY - rect.top) * (canvas.height / Math.max(1, rect.height)) / DPR
+      };
+    }
+
+    function worldToScreen(pt){
+      return {
+        x: pt.x * state.transform.k + state.transform.x,
+        y: pt.y * state.transform.k + state.transform.y
+      };
+    }
+
+    function screenToWorld(pt){
+      return {
+        x: (pt.x - state.transform.x) / Math.max(1e-9, state.transform.k),
+        y: (pt.y - state.transform.y) / Math.max(1e-9, state.transform.k)
+      };
+    }
+
+    function scheduleDraw(){
+      if (rafPending) return;
+      rafPending = true;
+      requestAnimationFrame(()=>{
+        rafPending = false;
+        draw();
+      });
+    }
+
+    function resize(){
+      W = Math.max(1, canvas.clientWidth || canvas.width || 1);
+      H = Math.max(1, canvas.clientHeight || canvas.height || 1);
+      canvas.width = Math.floor(W * DPR);
+      canvas.height = Math.floor(H * DPR);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      draw();
+    }
+
+    function normalizeGraph(graph){
+      const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+      const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+      const normalizedNodes = nodes
+        .map((node)=>({
+          id: typeof node?.id === 'string' ? node.id : '',
+          label: typeof node?.label === 'string' ? node.label : '',
+          owner: typeof node?.owner === 'string' ? node.owner : '',
+          url: typeof node?.url === 'string' ? node.url : null,
+          views: Number.isFinite(Number(node?.views)) ? Number(node.views) : null,
+          likes: Number.isFinite(Number(node?.likes)) ? Number(node.likes) : null,
+          remixes: Number.isFinite(Number(node?.remixes)) ? Number(node.remixes) : null,
+          comments: Number.isFinite(Number(node?.comments)) ? Number(node.comments) : null,
+          isPlaceholder: !!node?.isPlaceholder,
+          inDegree: Number.isFinite(Number(node?.inDegree)) ? Number(node.inDegree) : 0,
+          outDegree: Number.isFinite(Number(node?.outDegree)) ? Number(node.outDegree) : 0,
+          depth: Number.isFinite(Number(node?.depth)) ? Number(node.depth) : 0,
+          x: 0,
+          y: 0
+        }))
+        .filter((node)=>!!node.id);
+      const nodeSet = new Set(normalizedNodes.map((node)=>node.id));
+      const normalizedEdges = edges
+        .map((edge)=>({
+          sourceId: typeof edge?.sourceId === 'string' ? edge.sourceId : '',
+          targetId: typeof edge?.targetId === 'string' ? edge.targetId : '',
+          inferred: !!edge?.inferred
+        }))
+        .filter((edge)=>edge.sourceId && edge.targetId && nodeSet.has(edge.sourceId) && nodeSet.has(edge.targetId));
+      return {
+        nodes: normalizedNodes,
+        edges: normalizedEdges
+      };
+    }
+
+    function metricValue(node){
+      const metric = state.options.sizeMetric || NETWORK_SIZE_METRIC_DEFAULT;
+      if (metric === 'likes') return Number(node.likes) || 0;
+      if (metric === 'views') return Number(node.views) || 0;
+      return Number(node.remixes) || 0;
+    }
+
+    function rebuildLayout(){
+      state.nodeById.clear();
+      state.outAdj.clear();
+      state.inAdj.clear();
+      const nodes = state.graph.nodes;
+      const edges = state.graph.edges;
+      for (const node of nodes) state.nodeById.set(node.id, node);
+      for (const edge of edges) {
+        if (!state.outAdj.has(edge.sourceId)) state.outAdj.set(edge.sourceId, new Set());
+        if (!state.inAdj.has(edge.targetId)) state.inAdj.set(edge.targetId, new Set());
+        state.outAdj.get(edge.sourceId).add(edge.targetId);
+        state.inAdj.get(edge.targetId).add(edge.sourceId);
+      }
+      const byDepth = new Map();
+      let maxDepth = 0;
+      for (const node of nodes) {
+        const depth = Math.max(0, Number(node.depth) || 0);
+        if (!byDepth.has(depth)) byDepth.set(depth, []);
+        byDepth.get(depth).push(node);
+        if (depth > maxDepth) maxDepth = depth;
+      }
+      const allDepths = Array.from(byDepth.keys()).sort((a, b)=>a - b);
+      const columns = allDepths.length ? allDepths.length : 1;
+      const xSpacing = columns > 7 ? 190 : 220;
+      const ySpacing = nodes.length > 220 ? 32 : nodes.length > 140 ? 38 : 50;
+      for (const depth of allDepths) {
+        const col = byDepth.get(depth);
+        col.sort((a, b)=>{
+          const degreeA = (Number(a.inDegree) || 0) + (Number(a.outDegree) || 0);
+          const degreeB = (Number(b.inDegree) || 0) + (Number(b.outDegree) || 0);
+          if (degreeA !== degreeB) return degreeB - degreeA;
+          return String(a.id).localeCompare(String(b.id));
+        });
+        const maxRowsPerLane = nodes.length > 240 ? 20 : nodes.length > 160 ? 24 : 30;
+        const laneCount = Math.max(1, Math.ceil(col.length / maxRowsPerLane));
+        const rowsPerLane = Math.ceil(col.length / laneCount);
+        const laneSpacing = 70;
+        const laneOffset = (laneCount - 1) / 2;
+        const rowOffset = (rowsPerLane - 1) / 2;
+        for (let i = 0; i < col.length; i += 1) {
+          const node = col[i];
+          const lane = Math.floor(i / rowsPerLane);
+          const row = i % rowsPerLane;
+          node.x = depth * xSpacing + (lane - laneOffset) * laneSpacing;
+          node.y = (row - rowOffset) * ySpacing;
+        }
+      }
+      if (!nodes.length) {
+        state.bounds = null;
+      } else {
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
+        for (const node of nodes) {
+          if (node.x < minX) minX = node.x;
+          if (node.x > maxX) maxX = node.x;
+          if (node.y < minY) minY = node.y;
+          if (node.y > maxY) maxY = node.y;
+        }
+        const padX = 80;
+        const padY = 60;
+        state.bounds = {
+          minX: minX - padX,
+          maxX: maxX + padX,
+          minY: minY - padY,
+          maxY: maxY + padY,
+          maxDepth
+        };
+      }
+      const values = nodes.map((node)=>metricValue(node)).filter((v)=>Number.isFinite(v) && v > 0);
+      const min = values.length ? Math.min(...values) : 0;
+      const max = values.length ? Math.max(...values) : 1;
+      state.radii.clear();
+      for (const node of nodes) {
+        if (node.isPlaceholder) {
+          state.radii.set(node.id, 4.5);
+          continue;
+        }
+        const value = metricValue(node);
+        if (!values.length || !Number.isFinite(value) || value <= 0 || max <= min) {
+          state.radii.set(node.id, 6.5);
+          continue;
+        }
+        const norm = (value - min) / Math.max(1e-9, max - min);
+        state.radii.set(node.id, 5.5 + Math.sqrt(norm) * 8.5);
+      }
+    }
+
+    function fitToView(){
+      if (!state.bounds) {
+        state.transform = { x: W / 2, y: H / 2, k: 1 };
+        return;
+      }
+      const bounds = state.bounds;
+      const bw = Math.max(1, bounds.maxX - bounds.minX);
+      const bh = Math.max(1, bounds.maxY - bounds.minY);
+      const sx = (W - 24) / bw;
+      const sy = (H - 24) / bh;
+      const k = clamp(Math.min(sx, sy), 0.2, 3);
+      state.transform.k = k;
+      state.transform.x = (W - bw * k) / 2 - bounds.minX * k;
+      state.transform.y = (H - bh * k) / 2 - bounds.minY * k;
+    }
+
+    function focusNodeSet(){
+      const focusId = state.hoverId || state.selectionId || state.highlightId;
+      if (!focusId) return null;
+      const set = new Set([focusId]);
+      const out = state.outAdj.get(focusId);
+      if (out) for (const id of out) set.add(id);
+      const input = state.inAdj.get(focusId);
+      if (input) for (const id of input) set.add(id);
+      return set;
+    }
+
+    function resolveNodeColor(node){
+      if (node.isPlaceholder) return 'rgba(130,141,156,0.85)';
+      if (typeof state.options.colorForNode === 'function') {
+        const candidate = state.options.colorForNode(node);
+        if (typeof candidate === 'string' && candidate) return candidate;
+      }
+      return '#7dc4ff';
+    }
+
+    function drawLabels(nodes, focusSet){
+      const mode = state.options.labelDensity || NETWORK_LABEL_DENSITY_DEFAULT;
+      if (mode === 'off') return;
+      const sparseStep = nodes.length > 320 ? 18 : nodes.length > 160 ? 12 : 8;
+      ctx.font = '11px var(--font-system, system-ui)';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i < nodes.length; i += 1) {
+        const node = nodes[i];
+        const hasFocus = !!focusSet?.has(node.id);
+        const degree = (Number(node.inDegree) || 0) + (Number(node.outDegree) || 0);
+        const looksLikeRawPostId = /^s_[a-f0-9]{14,}$/i.test(String(node.id || ''));
+        if (node.isPlaceholder && mode !== 'all' && !hasFocus) continue;
+        let show = mode === 'all';
+        if (!show) {
+          show = hasFocus || degree >= 4 || (i % sparseStep === 0);
+          if (looksLikeRawPostId && !hasFocus && degree < 5) show = false;
+        }
+        if (!show) continue;
+        const pos = worldToScreen(node);
+        const radius = state.radii.get(node.id) || 6;
+        const rawLabel = (node.label || node.id || '').trim();
+        const label = rawLabel.length > 24 ? `${rawLabel.slice(0, 21)}...` : rawLabel;
+        ctx.fillStyle = 'rgba(236,243,248,0.84)';
+        ctx.fillText(label, pos.x + radius + 5, pos.y);
+      }
+    }
+
+    function draw(){
+      ctx.clearRect(0, 0, W, H);
+      const nodes = state.graph.nodes;
+      const edges = state.graph.edges;
+      if (!nodes.length) return;
+      const focusSet = focusNodeSet();
+      for (const edge of edges) {
+        const source = state.nodeById.get(edge.sourceId);
+        const target = state.nodeById.get(edge.targetId);
+        if (!source || !target) continue;
+        const a = worldToScreen(source);
+        const b = worldToScreen(target);
+        const dimmed = !!focusSet && !(focusSet.has(source.id) && focusSet.has(target.id));
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = edge.inferred
+          ? (dimmed ? 'rgba(150,162,175,0.18)' : 'rgba(159,173,188,0.58)')
+          : (dimmed ? 'rgba(125,196,255,0.14)' : 'rgba(125,196,255,0.42)');
+        if (edge.inferred) ctx.setLineDash([4, 3]);
+        else ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      for (const node of nodes) {
+        const pos = worldToScreen(node);
+        const radius = state.radii.get(node.id) || 6;
+        const isHover = state.hoverId === node.id;
+        const isSelected = state.selectionId === node.id;
+        const isHighlighted = state.highlightId === node.id;
+        const dimmed = !!focusSet && !focusSet.has(node.id);
+        const color = resolveNodeColor(node);
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = dimmed ? 'rgba(90,102,116,0.5)' : color;
+        ctx.fill();
+        if (isHover || isSelected || isHighlighted) {
+          ctx.lineWidth = isSelected ? 2.2 : 1.4;
+          ctx.strokeStyle = isSelected ? 'rgba(255,209,102,0.95)' : 'rgba(236,243,248,0.9)';
+          ctx.stroke();
+        } else if (!node.isPlaceholder) {
+          ctx.lineWidth = 0.8;
+          ctx.strokeStyle = 'rgba(12,16,22,0.6)';
+          ctx.stroke();
+        }
+      }
+      drawLabels(nodes, focusSet);
+    }
+
+    function pickNode(point){
+      const world = screenToWorld(point);
+      const nodes = state.graph.nodes;
+      for (let i = nodes.length - 1; i >= 0; i -= 1) {
+        const node = nodes[i];
+        const radius = (state.radii.get(node.id) || 6) / Math.max(0.2, state.transform.k) + 4 / Math.max(0.2, state.transform.k);
+        const dx = world.x - node.x;
+        const dy = world.y - node.y;
+        if ((dx * dx) + (dy * dy) <= (radius * radius)) return node;
+      }
+      return null;
+    }
+
+    function renderTooltip(node, clientX, clientY){
+      if (!tooltip) return;
+      ensureTooltipInBody(tooltip);
+      if (!node) {
+        tooltip.style.display = 'none';
+        return;
+      }
+      const viewsText = node.views != null ? fmt(node.views) : 'n/a';
+      const likesText = node.likes != null ? fmt(node.likes) : 'n/a';
+      const remixesText = node.remixes != null ? fmt(node.remixes) : 'n/a';
+      const owner = node.owner || 'unknown';
+      const title = node.label || node.id;
+      tooltip.style.display = 'block';
+      tooltip.innerHTML = `<strong title="${esc(title)}">${esc(title)}</strong><div class="tooltip-subtext">${esc(owner)} • ${esc(node.id)}</div><div class="tooltip-stats">Views ${viewsText} • Likes ${likesText} • Remixes ${remixesText}</div><div class="tooltip-subtext">In ${fmt(node.inDegree || 0)} • Out ${fmt(node.outDegree || 0)}</div>`;
+      const width = tooltip.offsetWidth || 0;
+      const maxLeft = window.innerWidth - width - 12;
+      const left = Math.max(12, Math.min(clientX + 10, maxLeft));
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${clientY + 10}px`;
+    }
+
+    function setHoverNode(nextNode, event){
+      const nextId = nextNode ? nextNode.id : null;
+      if (state.hoverId === nextId) {
+        if (nextNode && event) renderTooltip(nextNode, event.clientX, event.clientY);
+        return;
+      }
+      state.hoverId = nextId;
+      if (hoverCb) hoverCb(nextId);
+      if (nextNode && event) renderTooltip(nextNode, event.clientX, event.clientY);
+      else renderTooltip(null);
+      scheduleDraw();
+    }
+
+    canvas.addEventListener('mousemove', (e)=>{
+      const point = pointFromEvent(e);
+      if (pan) {
+        const dx = point.x - pan.lastX;
+        const dy = point.y - pan.lastY;
+        state.transform.x += dx;
+        state.transform.y += dy;
+        pan.lastX = point.x;
+        pan.lastY = point.y;
+        pan.moved = pan.moved || Math.hypot(point.x - pan.startX, point.y - pan.startY) > 4;
+        canvas.parentElement?.classList.add('is-panning');
+        renderTooltip(null);
+        scheduleDraw();
+        return;
+      }
+      const node = pickNode(point);
+      setHoverNode(node, e);
+    });
+    canvas.addEventListener('mouseleave', ()=>{
+      pan = null;
+      canvas.parentElement?.classList.remove('is-panning');
+      setHoverNode(null);
+    });
+    canvas.addEventListener('mousedown', (e)=>{
+      if (e.button !== 0) return;
+      const point = pointFromEvent(e);
+      pan = { startX: point.x, startY: point.y, lastX: point.x, lastY: point.y, moved: false };
+    });
+    window.addEventListener('mouseup', ()=>{
+      pan = null;
+      canvas.parentElement?.classList.remove('is-panning');
+    });
+    canvas.addEventListener('wheel', (e)=>{
+      e.preventDefault();
+      const point = pointFromEvent(e);
+      const world = screenToWorld(point);
+      const scale = e.deltaY < 0 ? 1.11 : 0.9;
+      const nextK = clamp(state.transform.k * scale, 0.08, 8);
+      state.transform.k = nextK;
+      state.transform.x = point.x - world.x * nextK;
+      state.transform.y = point.y - world.y * nextK;
+      scheduleDraw();
+    }, { passive: false });
+    canvas.addEventListener('click', (e)=>{
+      const point = pointFromEvent(e);
+      const node = pickNode(point);
+      if (pan?.moved) return;
+      if (!node) return;
+      state.selectionId = node.id;
+      if (selectCb) selectCb(node.id, node);
+      scheduleDraw();
+    });
+    canvas.addEventListener('dblclick', (e)=>{
+      const point = pointFromEvent(e);
+      const node = pickNode(point);
+      if (node?.url) {
+        window.open(node.url, '_blank', 'noopener');
+      } else {
+        fitToView();
+        scheduleDraw();
+      }
+    });
+    window.addEventListener('resize', resize);
+    resize();
+
+    function setGraph(graph){
+      state.graph = normalizeGraph(graph);
+      rebuildLayout();
+      fitToView();
+      if (state.selectionId && !state.nodeById.has(state.selectionId)) state.selectionId = null;
+      if (state.highlightId && !state.nodeById.has(state.highlightId)) state.highlightId = null;
+      if (state.hoverId && !state.nodeById.has(state.hoverId)) state.hoverId = null;
+      scheduleDraw();
+    }
+
+    function setOptions(opts){
+      if (!opts || typeof opts !== 'object') return;
+      if (normalizeNetworkSizeMetric(opts.sizeMetric)) state.options.sizeMetric = opts.sizeMetric;
+      if (normalizeNetworkLabelDensity(opts.labelDensity)) state.options.labelDensity = opts.labelDensity;
+      if (typeof opts.colorForNode === 'function') state.options.colorForNode = opts.colorForNode;
+      rebuildLayout();
+      scheduleDraw();
+    }
+
+    function setHighlight(postId){
+      const next = typeof postId === 'string' && postId ? postId : null;
+      state.highlightId = next && state.nodeById.has(next) ? next : null;
+      scheduleDraw();
+    }
+
+    function setSelection(postId){
+      const next = typeof postId === 'string' && postId ? postId : null;
+      state.selectionId = next && state.nodeById.has(next) ? next : null;
+      scheduleDraw();
+    }
+
+    function resetView(){
+      fitToView();
+      scheduleDraw();
+    }
+
+    function centerSelection(){
+      const targetId = state.selectionId || state.highlightId || state.hoverId;
+      if (!targetId) return;
+      const node = state.nodeById.get(targetId);
+      if (!node) return;
+      state.transform.x = W / 2 - node.x * state.transform.k;
+      state.transform.y = H / 2 - node.y * state.transform.k;
+      scheduleDraw();
+    }
+
+    function onHover(cb){
+      hoverCb = typeof cb === 'function' ? cb : null;
+    }
+
+    function onSelect(cb){
+      selectCb = typeof cb === 'function' ? cb : null;
+    }
+
+    return { setGraph, setOptions, setHighlight, setSelection, resetView, centerSelection, onHover, onSelect };
+  }
+
   async function exportCSV(user){
     await ensureFullSnapshots();
     const lines = ['post_id,timestamp,unique,likes,views,interaction_rate'];
@@ -6893,6 +7725,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         VIEWS_TYPE_STORAGE_KEY,
         BEST_TIME_PREFS_KEY,
         CHART_MODE_STORAGE_KEY,
+        NETWORK_PREFS_STORAGE_KEY,
         STACKED_WINDOW_STORAGE_MIN_KEYS.interaction,
         STACKED_WINDOW_STORAGE_MIN_KEYS.views,
         STACKED_WINDOW_STORAGE_MIN_KEYS.viewsPerPerson,
@@ -6911,6 +7744,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     syncUserSelectionUI();
     const initialViewsChartType = loadViewsChartType();
     const initialChartsMode = loadChartMode(CHART_MODE_STORAGE_KEY);
+    const initialNetworkPrefs = loadNetworkPrefs();
     const legacyChartModes = {
       interaction: loadChartMode(LEGACY_CHART_MODE_KEYS.interaction),
       views: loadChartMode(LEGACY_CHART_MODE_KEYS.views),
@@ -6923,6 +7757,13 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const shouldPersistLegacyChartMode = !initialChartsMode && !!legacyChartsMode;
     let chartsMode = initialChartsMode || legacyChartsMode || 'linear';
     let chartModeLoaded = !!initialChartsMode || !!legacyChartsMode;
+    let networkMode = initialNetworkPrefs?.mode || NETWORK_MODE_DEFAULT;
+    let networkSizeMetric = initialNetworkPrefs?.sizeMetric || NETWORK_SIZE_METRIC_DEFAULT;
+    let networkLabelDensity = initialNetworkPrefs?.labelDensity || NETWORK_LABEL_DENSITY_DEFAULT;
+    let networkOwnerFilter = initialNetworkPrefs?.ownerFilter || NETWORK_OWNER_FILTER_DEFAULT;
+    let topRemixersOwnerFilter = 'selected';
+    let networkPrefsLoaded = !!initialNetworkPrefs;
+    let networkSelectionPostId = null;
     let chart = makeChart($('#chart'), viewsAxisLabel, viewsAxisLabel);
     let interactionRateStackedChart = makeFirst24HoursChart(
       $('#interactionRateStackedChart'),
@@ -6942,6 +7783,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     let allViewsChart = makeTimeChart($('#allViewsChart'), '#allViewsTooltip', 'Total Views', fmt2);
     const allLikesChart = makeTimeChart($('#allLikesChart'), '#allLikesTooltip', 'Likes', fmt2);
     const cameosChart = makeTimeChart($('#cameosChart'), '#cameosTooltip', 'Cast in', fmt2);
+    const remixNetworkCanvas = $('#remixNetworkCanvas');
+    const remixNetworkChart = remixNetworkCanvas ? makeRemixNetworkChart(remixNetworkCanvas, '#remixNetworkTooltip') : null;
     const PRESET_VISIBILITY_ACTIONS = new Set([
       'pastDay',
       'pastWeek',
@@ -9413,6 +10256,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       likesPerMinuteTimeChart.setData([]);
       viewsPerMinuteChart.setData([]);
       viewsPerMinuteTimeChart.setData([]);
+      updateRemixNetworkShell(null, visibleSet, null);
       return;
     }
         // No precompute needed for IR; use latest available remix count only for cards
@@ -9576,6 +10420,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             first24HoursChart.setHoverSeries(pid);
             viewsPerPersonChart.setHoverSeries(pid);
             viewsPerPersonTimeChart.setHoverSeries(pid);
+            if (remixNetworkChart) remixNetworkChart.setHighlight(pid || networkSelectionPostId);
           },
           onPurge: (pid, snippet) => showPostPurgeConfirm(snippet, pid)
         };
@@ -9808,6 +10653,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             perfEnd(perfCharts);
           }
         }
+      updateRemixNetworkShell(user, visibleSet, colorFor);
       // Restore any saved zoom for this user (unless skipRestoreZoom is true)
       if (!skipRestoreZoom) {
         try {
@@ -9834,6 +10680,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       ];
       const syncHoverCharts = (pid)=>{
         hoverCharts.forEach((c)=> c.setHoverSeries(pid));
+        if (remixNetworkChart) remixNetworkChart.setHighlight(pid || networkSelectionPostId);
       };
       const handleChartHover = (pid)=>{
         const wrap = $('#posts');
@@ -9848,6 +10695,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         syncHoverCharts(pid);
       };
       hoverCharts.forEach((c)=> c.onHover(handleChartHover));
+      if (remixNetworkChart) remixNetworkChart.onHover(handleChartHover);
       // wire visibility toggles (delegated)
       const postsWrap = $('#posts');
       if (postsWrap) {
@@ -10347,6 +11195,463 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       });
     }
 
+    function normalizeNetworkOwnerKey(owner){
+      const normalized = normalizeCameoName(owner || '');
+      return normalized || '__unknown__';
+    }
+
+    function formatNetworkOwnerLabel(ownerKey){
+      if (!ownerKey || ownerKey === '__unknown__') return 'Unknown';
+      return ownerKey.startsWith('@') ? ownerKey : `@${ownerKey}`;
+    }
+
+    function withRecomputedGraphMeta(graph){
+      const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map((node)=>({ ...node, inDegree: 0, outDegree: 0 })) : [];
+      const nodeById = new Map(nodes.map((node)=>[node.id, node]));
+      const edges = Array.isArray(graph?.edges)
+        ? graph.edges.filter((edge)=>nodeById.has(edge.sourceId) && nodeById.has(edge.targetId))
+        : [];
+      for (const edge of edges) {
+        const source = nodeById.get(edge.sourceId);
+        const target = nodeById.get(edge.targetId);
+        if (!source || !target) continue;
+        source.outDegree = (Number(source.outDegree) || 0) + 1;
+        target.inDegree = (Number(target.inDegree) || 0) + 1;
+      }
+      return {
+        mode: graph?.mode || networkMode,
+        nodes,
+        edges,
+        meta: {
+          ...(graph?.meta || {}),
+          nodeCount: nodes.length,
+          edgeCount: edges.length
+        }
+      };
+    }
+
+    function renderRemixNetworkInsights(graph, user, opts = {}){
+      const keyStatsBody = $('#remixNetworkKeyStatsBody');
+      const topRemixersBody = $('#remixNetworkTopRemixersBody');
+      if (!keyStatsBody || !topRemixersBody) return;
+      const insights = computeRemixNetworkInsights(graph, user, opts);
+      const statsRows = insights?.statsRows || [];
+      const topRemixers = Array.isArray(insights?.topRemixers) ? insights.topRemixers : [];
+      keyStatsBody.innerHTML = statsRows.map(([label, value])=>`<tr><td>${esc(label)}</td><td>${esc(value)}</td></tr>`).join('');
+      if (!topRemixers.length) {
+        topRemixersBody.innerHTML = '<tr><td colspan="3">No remixers found for this filter.</td></tr>';
+        return;
+      }
+      topRemixersBody.innerHTML = topRemixers.slice(0, 12).map((row, idx)=>`<tr><td>${idx + 1}</td><td>${esc(formatNetworkOwnerLabel(row.ownerKey))}</td><td>${fmt(row.count)}</td></tr>`).join('');
+    }
+
+    function renderTopRemixersPanel(graph, user){
+      const statsEl = $('#topRemixersStats');
+      const bodyEl = $('#topRemixersBody');
+      const selectEl = $('#topRemixersOwnerFilter');
+      if (!statsEl || !bodyEl || !selectEl) return;
+      if (!user || !user.posts) {
+        statsEl.textContent = 'No remix data';
+        selectEl.innerHTML = '<option value="selected">Selected Profile</option>';
+        selectEl.value = 'selected';
+        bodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view remixers.</td></tr>';
+        return;
+      }
+      const selectedOwner = normalizeCameoName(user?.handle || '');
+      const sourceOwners = collectRemixSourceOwners(graph);
+      const defaultFilter = (typeof user?.__specialKey === 'string' && !!user.__specialKey) ? 'all' : 'selected';
+      const nextOptions = [];
+      const optionHtml = [];
+      if (defaultFilter === 'all') {
+        nextOptions.push('all');
+        optionHtml.push('<option value="all">All Visible Users</option>');
+      } else {
+        nextOptions.push('selected');
+        optionHtml.push('<option value="selected">Selected Profile</option>');
+      }
+      for (const [ownerKey] of sourceOwners) {
+        if (!ownerKey) continue;
+        if (defaultFilter !== 'all' && ownerKey === selectedOwner) continue;
+        const value = `user:${ownerKey}`;
+        nextOptions.push(value);
+        optionHtml.push(`<option value="${esc(value)}">${esc(formatNetworkOwnerLabel(ownerKey))}</option>`);
+      }
+      selectEl.innerHTML = optionHtml.join('');
+      if (!nextOptions.includes(topRemixersOwnerFilter)) topRemixersOwnerFilter = defaultFilter;
+      selectEl.value = topRemixersOwnerFilter;
+      const sourceOwnerKey = topRemixersOwnerFilter === 'all'
+        ? '*'
+        : (topRemixersOwnerFilter.startsWith('user:') ? topRemixersOwnerFilter.slice(5) : '');
+      const insights = computeRemixNetworkInsights(graph, user, {
+        filteredGraph: graph,
+        sourceOwnerKey
+      });
+      const topRemixers = Array.isArray(insights?.topRemixers) ? insights.topRemixers : [];
+      const uniqueRemixers = insights?.statsRows?.[2]?.[1] || '0';
+      const directRemixEdges = insights?.statsRows?.[3]?.[1] || '0';
+      const visiblePosts = Number(graph?.meta?.selectedPosts) || 0;
+      const scopeLabel = topRemixersOwnerFilter === 'all'
+        ? 'all visible users'
+        : (topRemixersOwnerFilter.startsWith('user:')
+          ? `@${formatNetworkOwnerLabel(topRemixersOwnerFilter.slice(5))}`
+          : 'selected profile');
+      statsEl.textContent = `${uniqueRemixers} remixers • ${directRemixEdges} remixes • ${fmt(visiblePosts)} visible posts • ${scopeLabel}`;
+      if (!topRemixers.length) {
+        bodyEl.innerHTML = '<tr><td colspan="3">No remixers found for the current post filter.</td></tr>';
+        return;
+      }
+      bodyEl.innerHTML = topRemixers.slice(0, 20).map((row, idx)=>`<tr><td>${idx + 1}</td><td>${esc(formatNetworkOwnerLabel(row.ownerKey))}</td><td>${fmt(row.count)}</td></tr>`).join('');
+    }
+
+    function refreshNetworkOwnerFilterOptions(baseGraph, user){
+      const select = $('#networkOwnerFilter');
+      if (!select) return [];
+      const selectedOwner = normalizeCameoName(user?.handle || '');
+      const counts = new Map();
+      for (const node of (baseGraph?.nodes || [])) {
+        if (!node || node.isPlaceholder) continue;
+        const ownerKey = normalizeNetworkOwnerKey(node.owner);
+        counts.set(ownerKey, (counts.get(ownerKey) || 0) + 1);
+      }
+      const owners = Array.from(counts.entries())
+        .sort((a, b)=> (b[1] - a[1]) || a[0].localeCompare(b[0]));
+      const options = ['all', 'selected'];
+      const optionHtml = [
+        '<option value="all">All Users</option>',
+        '<option value="selected">Selected User Only</option>'
+      ];
+      for (const [ownerKey] of owners) {
+        if (ownerKey === selectedOwner) continue;
+        const value = `user:${ownerKey}`;
+        options.push(value);
+        const label = selectedOwner
+          ? `Selected + ${formatNetworkOwnerLabel(ownerKey)}`
+          : formatNetworkOwnerLabel(ownerKey);
+        optionHtml.push(`<option value="${esc(value)}">${esc(label)}</option>`);
+      }
+      select.innerHTML = optionHtml.join('');
+      if (!options.includes(networkOwnerFilter)) networkOwnerFilter = NETWORK_OWNER_FILTER_DEFAULT;
+      select.value = networkOwnerFilter;
+      return options;
+    }
+
+    function applyNetworkOwnerFilter(baseGraph, user){
+      if (networkOwnerFilter === 'all') return withRecomputedGraphMeta(baseGraph);
+      const selectedOwner = normalizeCameoName(user?.handle || '');
+      const includeOwners = new Set();
+      if (networkOwnerFilter === 'selected') {
+        if (selectedOwner) includeOwners.add(selectedOwner);
+      } else if (networkOwnerFilter.startsWith('user:')) {
+        const ownerKey = networkOwnerFilter.slice(5);
+        if (ownerKey) includeOwners.add(ownerKey);
+        if (selectedOwner) includeOwners.add(selectedOwner);
+      }
+      if (!includeOwners.size) return withRecomputedGraphMeta({ ...baseGraph, nodes: [], edges: [] });
+      const keptNodes = (baseGraph?.nodes || []).filter((node)=>{
+        if (!node || node.isPlaceholder) return false;
+        const ownerKey = normalizeNetworkOwnerKey(node.owner);
+        return includeOwners.has(ownerKey);
+      });
+      const keptNodeIds = new Set(keptNodes.map((node)=>node.id));
+      const keptEdges = (baseGraph?.edges || []).filter((edge)=>keptNodeIds.has(edge.sourceId) && keptNodeIds.has(edge.targetId));
+      return withRecomputedGraphMeta({
+        mode: baseGraph?.mode || networkMode,
+        nodes: keptNodes,
+        edges: keptEdges,
+        meta: baseGraph?.meta || {}
+      });
+    }
+
+    function persistNetworkPrefs(){
+      saveNetworkPrefs({
+        mode: networkMode,
+        sizeMetric: networkSizeMetric,
+        labelDensity: networkLabelDensity,
+        ownerFilter: networkOwnerFilter
+      });
+      networkPrefsLoaded = true;
+    }
+
+    function updateNetworkCenterButtonState(){
+      const centerBtn = $('#remixNetworkCenterSelection');
+      if (!centerBtn) return;
+      centerBtn.disabled = !networkSelectionPostId;
+    }
+
+    function syncNetworkControls(){
+      setToggleState($('#networkModeVisible'), networkMode === 'visible');
+      setToggleState($('#networkModeAll'), networkMode === 'all');
+      setToggleState($('#networkSizeRemixes'), networkSizeMetric === 'remixes');
+      setToggleState($('#networkSizeLikes'), networkSizeMetric === 'likes');
+      setToggleState($('#networkSizeViews'), networkSizeMetric === 'views');
+      setToggleState($('#networkLabelsOff'), networkLabelDensity === 'off');
+      setToggleState($('#networkLabelsSparse'), networkLabelDensity === 'sparse');
+      setToggleState($('#networkLabelsAll'), networkLabelDensity === 'all');
+      const ownerFilterSelect = $('#networkOwnerFilter');
+      if (ownerFilterSelect && ownerFilterSelect.value !== networkOwnerFilter) {
+        ownerFilterSelect.value = networkOwnerFilter;
+      }
+      updateNetworkCenterButtonState();
+    }
+
+    function setNetworkMode(mode, opts = {}){
+      const normalized = normalizeNetworkMode(mode) || NETWORK_MODE_DEFAULT;
+      const persist = opts.persist !== false;
+      const refresh = opts.refresh !== false;
+      const changed = normalized !== networkMode;
+      networkMode = normalized;
+      syncNetworkControls();
+      if (persist && (changed || !networkPrefsLoaded)) persistNetworkPrefs();
+      if (refresh) updateRemixNetworkShell(resolveUserForKey(metrics, currentUserKey), visibleSet);
+    }
+
+    function setNetworkSizeMetric(metric, opts = {}){
+      const normalized = normalizeNetworkSizeMetric(metric) || NETWORK_SIZE_METRIC_DEFAULT;
+      const persist = opts.persist !== false;
+      const refresh = opts.refresh !== false;
+      const changed = normalized !== networkSizeMetric;
+      networkSizeMetric = normalized;
+      syncNetworkControls();
+      if (persist && (changed || !networkPrefsLoaded)) persistNetworkPrefs();
+      if (refresh) updateRemixNetworkShell(resolveUserForKey(metrics, currentUserKey), visibleSet);
+    }
+
+    function setNetworkLabelDensity(density, opts = {}){
+      const normalized = normalizeNetworkLabelDensity(density) || NETWORK_LABEL_DENSITY_DEFAULT;
+      const persist = opts.persist !== false;
+      const refresh = opts.refresh !== false;
+      const changed = normalized !== networkLabelDensity;
+      networkLabelDensity = normalized;
+      syncNetworkControls();
+      if (persist && (changed || !networkPrefsLoaded)) persistNetworkPrefs();
+      if (refresh) updateRemixNetworkShell(resolveUserForKey(metrics, currentUserKey), visibleSet);
+    }
+
+    function setNetworkOwnerFilter(ownerFilter, opts = {}){
+      const normalized = normalizeNetworkOwnerFilter(ownerFilter) || NETWORK_OWNER_FILTER_DEFAULT;
+      const persist = opts.persist !== false;
+      const refresh = opts.refresh !== false;
+      const changed = normalized !== networkOwnerFilter;
+      networkOwnerFilter = normalized;
+      syncNetworkControls();
+      if (persist && (changed || !networkPrefsLoaded)) persistNetworkPrefs();
+      if (refresh) updateRemixNetworkShell(resolveUserForKey(metrics, currentUserKey), visibleSet);
+    }
+
+    let remixNetworkPostResolverCacheKey = null;
+    let remixNetworkPostResolver = null;
+    function getRemixNetworkPostResolver(){
+      const users = metrics?.users && typeof metrics.users === 'object' ? metrics.users : {};
+      const cacheKey = `${Number(lastMetricsUpdatedAt) || 0}:${Object.keys(users).length}:${isMetricsPartial ? 1 : 0}`;
+      if (remixNetworkPostResolver && remixNetworkPostResolverCacheKey === cacheKey) return remixNetworkPostResolver;
+
+      const postCache = new Map();
+      const fillFields = ['url', 'thumb', 'caption', 'title', 'label', 'ownerKey', 'ownerId', 'ownerHandle', 'post_time', 'postTime', 'parent_post_id', 'root_post_id', 'lastSeen'];
+      const deriveOwnerHandle = (userKey, user, post)=>{
+        const byPost = typeof post?.ownerHandle === 'string' ? post.ownerHandle.trim() : '';
+        if (byPost) return byPost;
+        const byUser = typeof user?.handle === 'string' ? user.handle.trim() : '';
+        if (byUser) return byUser;
+        if (typeof userKey === 'string' && userKey.startsWith('h:')) {
+          const fromKey = userKey.slice(2).trim();
+          if (fromKey) return fromKey;
+        }
+        return null;
+      };
+      const getSnapshotCount = (post)=> Array.isArray(post?.snapshots) ? post.snapshots.length : 0;
+      const getLatestSnapshotTs = (post)=>{
+        let best = 0;
+        for (const snap of (Array.isArray(post?.snapshots) ? post.snapshots : [])) {
+          const ts = toTs(snap?.t);
+          if (ts > best) best = ts;
+        }
+        return best;
+      };
+      const choosePrimaryEntry = (left, right)=>{
+        const leftPost = left?.post || {};
+        const rightPost = right?.post || {};
+        const leftSnapshots = getSnapshotCount(leftPost);
+        const rightSnapshots = getSnapshotCount(rightPost);
+        if (leftSnapshots !== rightSnapshots) return rightSnapshots > leftSnapshots ? right : left;
+        const leftLatest = getLatestSnapshotTs(leftPost);
+        const rightLatest = getLatestSnapshotTs(rightPost);
+        if (leftLatest !== rightLatest) return rightLatest > leftLatest ? right : left;
+        const leftOwner = left?.ownerHandle ? 1 : 0;
+        const rightOwner = right?.ownerHandle ? 1 : 0;
+        if (leftOwner !== rightOwner) return rightOwner > leftOwner ? right : left;
+        const leftCaption = leftPost?.caption ? 1 : 0;
+        const rightCaption = rightPost?.caption ? 1 : 0;
+        if (leftCaption !== rightCaption) return rightCaption > leftCaption ? right : left;
+        const leftUrl = leftPost?.url ? 1 : 0;
+        const rightUrl = rightPost?.url ? 1 : 0;
+        if (leftUrl !== rightUrl) return rightUrl > leftUrl ? right : left;
+        return String(right?.userKey || '').localeCompare(String(left?.userKey || '')) < 0 ? right : left;
+      };
+      const mergeEntries = (left, right)=>{
+        if (!left) return right;
+        if (!right) return left;
+        const primary = choosePrimaryEntry(left, right);
+        const secondary = primary === left ? right : left;
+        const mergedPost = { ...(primary?.post || {}) };
+        for (const field of fillFields) {
+          if (!mergedPost[field] && secondary?.post?.[field]) mergedPost[field] = secondary.post[field];
+        }
+        const mergedSnapshots = mergeSnapshotsByTimestamp(primary?.post?.snapshots, secondary?.post?.snapshots);
+        if (mergedSnapshots.length) mergedPost.snapshots = mergedSnapshots;
+        const remixIds = [];
+        const seenRemixIds = new Set();
+        for (const candidate of [primary?.post?.remix_post_ids, secondary?.post?.remix_post_ids]) {
+          if (!Array.isArray(candidate)) continue;
+          for (const rawId of candidate) {
+            if (typeof rawId !== 'string') continue;
+            const remixId = rawId.trim();
+            if (!remixId || seenRemixIds.has(remixId)) continue;
+            seenRemixIds.add(remixId);
+            remixIds.push(remixId);
+          }
+        }
+        if (remixIds.length) mergedPost.remix_post_ids = remixIds;
+        return {
+          userKey: primary?.userKey || secondary?.userKey || null,
+          ownerHandle: primary?.ownerHandle || secondary?.ownerHandle || null,
+          ownerId: primary?.ownerId || secondary?.ownerId || null,
+          post: mergedPost
+        };
+      };
+
+      remixNetworkPostResolver = (postId)=>{
+        if (!postId || typeof postId !== 'string') return null;
+        if (postCache.has(postId)) return postCache.get(postId);
+        let best = null;
+        for (const [userKey, bucket] of Object.entries(users)) {
+          if (!bucket?.posts || isVirtualUserKey(userKey)) continue;
+          const post = bucket.posts?.[postId];
+          if (!post) continue;
+          best = mergeEntries(best, {
+            userKey,
+            ownerHandle: deriveOwnerHandle(userKey, bucket, post),
+            ownerId: post?.ownerId || bucket?.id || null,
+            post
+          });
+        }
+        postCache.set(postId, best || null);
+        return best || null;
+      };
+      remixNetworkPostResolverCacheKey = cacheKey;
+      return remixNetworkPostResolver;
+    }
+
+    function updateRemixNetworkShell(user, visibleIds, colorFor = null){
+      const panelStatsEl = $('#topRemixersStats');
+      const panelBodyEl = $('#topRemixersBody');
+      const statsEl = $('#remixNetworkStats');
+      const truncEl = $('#remixNetworkTruncation');
+      const emptyEl = $('#remixNetworkEmpty');
+      const canvasWrap = $('#remixNetworkCanvas')?.closest('.remix-network-wrap');
+      if (!user || !user.posts) {
+        if (panelStatsEl && panelBodyEl) {
+          panelStatsEl.textContent = 'No remix data';
+          panelBodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view remixers.</td></tr>';
+        }
+        if (!remixNetworkChart) return;
+        networkSelectionPostId = null;
+        networkOwnerFilter = NETWORK_OWNER_FILTER_DEFAULT;
+        updateNetworkCenterButtonState();
+        remixNetworkChart.setGraph({ nodes: [], edges: [] });
+        remixNetworkChart.setSelection(null);
+        remixNetworkChart.setHighlight(null);
+        const ownerFilterSelect = $('#networkOwnerFilter');
+        if (ownerFilterSelect) {
+          ownerFilterSelect.innerHTML = '<option value="all">All Users</option><option value="selected">Selected User Only</option>';
+          ownerFilterSelect.value = networkOwnerFilter;
+        }
+        const keyStatsBody = $('#remixNetworkKeyStatsBody');
+        if (keyStatsBody) keyStatsBody.innerHTML = '<tr><td>No data</td><td>—</td></tr>';
+        const topRemixersBody = $('#remixNetworkTopRemixersBody');
+        if (topRemixersBody) topRemixersBody.innerHTML = '<tr><td colspan="3">Select a profile to view remixers.</td></tr>';
+        if (statsEl) statsEl.textContent = '0 nodes • 0 edges';
+        if (truncEl) {
+          truncEl.textContent = '';
+          truncEl.classList.add('is-hidden');
+        }
+        if (emptyEl) {
+          emptyEl.textContent = 'Select a profile to view remix relationships.';
+          emptyEl.classList.remove('is-hidden');
+        }
+        if (canvasWrap) canvasWrap.classList.remove('is-panning');
+        return;
+      }
+      const baseGraph = buildRemixNetworkForUser(user, visibleIds, {
+        mode: 'visible',
+        maxNodes: Number.MAX_SAFE_INTEGER,
+        maxEdges: Number.MAX_SAFE_INTEGER,
+        resolvePostById: getRemixNetworkPostResolver()
+      });
+      renderTopRemixersPanel(baseGraph, user);
+      if (!remixNetworkChart) return;
+      const networkGraph = buildRemixNetworkForUser(user, visibleIds, {
+        mode: networkMode,
+        resolvePostById: getRemixNetworkPostResolver()
+      });
+      const validOwnerFilters = refreshNetworkOwnerFilterOptions(networkGraph, user);
+      if (!validOwnerFilters.includes(networkOwnerFilter)) {
+        networkOwnerFilter = NETWORK_OWNER_FILTER_DEFAULT;
+        syncNetworkControls();
+      }
+      const graph = applyNetworkOwnerFilter(networkGraph, user);
+      remixNetworkChart.setOptions({
+        sizeMetric: networkSizeMetric,
+        labelDensity: networkLabelDensity,
+        colorForNode: (node)=>{
+          if (node?.isPlaceholder) return 'rgba(130,141,156,0.85)';
+          if (typeof colorFor === 'function' && node?.id) return colorFor(node.id);
+          return '#7dc4ff';
+        }
+      });
+      remixNetworkChart.setGraph(graph);
+      if (networkSelectionPostId && !graph.nodes.some((node)=>node.id === networkSelectionPostId)) {
+        networkSelectionPostId = null;
+      }
+      remixNetworkChart.setSelection(networkSelectionPostId);
+      remixNetworkChart.setHighlight(networkSelectionPostId);
+      updateNetworkCenterButtonState();
+      if (statsEl) {
+        const selectedPosts = Number(networkGraph?.meta?.selectedPosts) || 0;
+        const ownerFilterLabel = (function(){
+          if (networkOwnerFilter === 'all') return 'All Users';
+          if (networkOwnerFilter === 'selected') return 'Selected User';
+          const ownerKey = networkOwnerFilter.startsWith('user:') ? networkOwnerFilter.slice(5) : '';
+          return ownerKey ? `Selected + ${formatNetworkOwnerLabel(ownerKey)}` : 'All Users';
+        })();
+        statsEl.textContent = `${fmt(graph.meta.nodeCount)} nodes • ${fmt(graph.meta.edgeCount)} edges • ${fmt(selectedPosts)} seed posts • ${ownerFilterLabel}`;
+      }
+      const truncatedNodes = Number(networkGraph?.meta?.truncatedNodes) || 0;
+      const truncatedEdges = Number(networkGraph?.meta?.truncatedEdges) || 0;
+      if (truncEl) {
+        if (truncatedNodes > 0 || truncatedEdges > 0) {
+          truncEl.textContent = `Showing capped graph (${fmt(truncatedNodes)} nodes, ${fmt(truncatedEdges)} edges hidden)`;
+          truncEl.classList.remove('is-hidden');
+        } else {
+          truncEl.textContent = '';
+          truncEl.classList.add('is-hidden');
+        }
+      }
+      if (emptyEl) {
+        if (graph.nodes.length === 0) {
+          emptyEl.textContent = networkOwnerFilter !== 'all'
+            ? 'No network data for the selected user filter.'
+            : (networkMode === 'visible'
+              ? 'No remix edges in the current visible post selection.'
+              : 'No remix edges found across this user\'s posts yet.');
+          emptyEl.classList.remove('is-hidden');
+        } else {
+          emptyEl.classList.add('is-hidden');
+          emptyEl.textContent = '';
+        }
+      }
+      renderRemixNetworkInsights(networkGraph, user, { filteredGraph: graph });
+    }
+
     function fmtStackedWindow(minutes){
       if (minutes < 60) return `${minutes}m`;
       const totalMinutes = Math.round(minutes);
@@ -10694,7 +11999,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           '#likesPerMinuteTimeTooltip',
           '#likesPerMinuteTooltip',
           '#viewsPerMinuteTimeTooltip',
-          '#viewsPerMinuteTooltip'
+          '#viewsPerMinuteTooltip',
+          '#remixNetworkTooltip'
         ]);
         if (isStacked) ensureStackedWindowHasData();
         syncViewsHeaders();
@@ -10715,6 +12021,39 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const chartModeStackedBtn = $('#chartModeStacked');
     if (chartModeLinearBtn) chartModeLinearBtn.addEventListener('click', ()=> setGlobalChartMode('linear'));
     if (chartModeStackedBtn) chartModeStackedBtn.addEventListener('click', ()=> setGlobalChartMode('stacked'));
+    const networkModeVisibleBtn = $('#networkModeVisible');
+    const networkModeAllBtn = $('#networkModeAll');
+    const networkSizeRemixesBtn = $('#networkSizeRemixes');
+    const networkSizeLikesBtn = $('#networkSizeLikes');
+    const networkSizeViewsBtn = $('#networkSizeViews');
+    const networkLabelsOffBtn = $('#networkLabelsOff');
+    const networkLabelsSparseBtn = $('#networkLabelsSparse');
+    const networkLabelsAllBtn = $('#networkLabelsAll');
+    const networkOwnerFilterSelect = $('#networkOwnerFilter');
+    const topRemixersOwnerFilterSelect = $('#topRemixersOwnerFilter');
+    const remixNetworkResetBtn = $('#remixNetworkResetView');
+    const remixNetworkCenterBtn = $('#remixNetworkCenterSelection');
+    if (networkModeVisibleBtn) networkModeVisibleBtn.addEventListener('click', ()=> setNetworkMode('visible'));
+    if (networkModeAllBtn) networkModeAllBtn.addEventListener('click', ()=> setNetworkMode('all'));
+    if (networkSizeRemixesBtn) networkSizeRemixesBtn.addEventListener('click', ()=> setNetworkSizeMetric('remixes'));
+    if (networkSizeLikesBtn) networkSizeLikesBtn.addEventListener('click', ()=> setNetworkSizeMetric('likes'));
+    if (networkSizeViewsBtn) networkSizeViewsBtn.addEventListener('click', ()=> setNetworkSizeMetric('views'));
+    if (networkLabelsOffBtn) networkLabelsOffBtn.addEventListener('click', ()=> setNetworkLabelDensity('off'));
+    if (networkLabelsSparseBtn) networkLabelsSparseBtn.addEventListener('click', ()=> setNetworkLabelDensity('sparse'));
+    if (networkLabelsAllBtn) networkLabelsAllBtn.addEventListener('click', ()=> setNetworkLabelDensity('all'));
+    if (networkOwnerFilterSelect) networkOwnerFilterSelect.addEventListener('change', (e)=> setNetworkOwnerFilter(e.target.value));
+    if (topRemixersOwnerFilterSelect) topRemixersOwnerFilterSelect.addEventListener('change', (e)=>{
+      topRemixersOwnerFilter = typeof e?.target?.value === 'string' ? e.target.value : 'selected';
+      updateRemixNetworkShell(resolveUserForKey(metrics, currentUserKey), visibleSet);
+    });
+    if (remixNetworkChart && remixNetworkResetBtn) remixNetworkResetBtn.addEventListener('click', ()=> remixNetworkChart.resetView());
+    if (remixNetworkChart && remixNetworkCenterBtn) remixNetworkCenterBtn.addEventListener('click', ()=> remixNetworkChart.centerSelection());
+    if (remixNetworkChart) remixNetworkChart.onSelect((postId)=>{
+      networkSelectionPostId = typeof postId === 'string' && postId ? postId : null;
+      remixNetworkChart.setHighlight(networkSelectionPostId);
+      updateNetworkCenterButtonState();
+    });
+    syncNetworkControls();
     applyStackedWindowDefaults();
     setGlobalChartMode(chartsMode, { persist: shouldPersistLegacyChartMode });
     syncViewsHeaders(viewsChartType);
@@ -11074,6 +12413,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         SIDEBAR_WIDTH_KEY,
         VIEWS_TYPE_STORAGE_KEY,
         CHART_MODE_STORAGE_KEY,
+        NETWORK_PREFS_STORAGE_KEY,
         BEST_TIME_PREFS_KEY,
         'sctLastFilterAction',
         'sctLastFilterActionByUser'
@@ -11089,6 +12429,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         BEST_TIME_PREFS_KEY,
         VIEWS_TYPE_STORAGE_KEY,
         CHART_MODE_STORAGE_KEY,
+        NETWORK_PREFS_STORAGE_KEY,
         'lastFilterAction',
         'lastFilterActionByUser',
         'lastUserKey',
@@ -11872,6 +13213,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       allViewsChart.resetZoom();
       allLikesChart.resetZoom();
       cameosChart.resetZoom();
+      if (remixNetworkChart) remixNetworkChart.resetView();
     }
     window.addEventListener('beforeunload', persistZoom);
     window.addEventListener('beforeunload', saveSessionCache);
@@ -12557,6 +13899,14 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           }
           chartModeLoaded = true;
         }
+      }
+      const storedNetworkPrefs = normalizeNetworkPrefs(st?.[NETWORK_PREFS_STORAGE_KEY]);
+      if (storedNetworkPrefs && !networkPrefsLoaded) {
+        if (storedNetworkPrefs.mode) setNetworkMode(storedNetworkPrefs.mode, { persist: false, refresh: false });
+        if (storedNetworkPrefs.sizeMetric) setNetworkSizeMetric(storedNetworkPrefs.sizeMetric, { persist: false, refresh: false });
+        if (storedNetworkPrefs.labelDensity) setNetworkLabelDensity(storedNetworkPrefs.labelDensity, { persist: false, refresh: false });
+        if (storedNetworkPrefs.ownerFilter) setNetworkOwnerFilter(storedNetworkPrefs.ownerFilter, { persist: false, refresh: false });
+        networkPrefsLoaded = true;
       }
       const storedInteractionMin = normalizeStackedWindowStartMinutes(st?.[STACKED_WINDOW_STORAGE_MIN_KEYS.interaction], null);
       const storedInteractionMax = normalizeStackedWindowMinutes(st?.[STACKED_WINDOW_STORAGE_KEYS.interaction], null);
