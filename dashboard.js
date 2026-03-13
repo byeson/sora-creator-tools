@@ -6104,9 +6104,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       
       // === SHEET 1: Posts Summary (one row per post with latest snapshot) ===
       const postsHeader = [
-        'User Key', 'User Handle', 'User ID', 
+        'User Key', 'User Handle', 'User ID',
         'Post ID', 'Post URL', 'Post Time', 'Post Time (ISO)', 'Caption',
-        'Thumbnail URL', 'Parent Post ID', 'Root Post ID', 'Last Seen Timestamp',
+        'Thumbnail URL', 'Parent Post ID', 'Root Post ID', 'Remix Post IDs', 'Last Seen Timestamp',
         'Owner Key', 'Owner Handle', 'Owner ID',
         'Latest Snapshot Timestamp', 'Unique Views', 'Total Views', 'Likes', 'Comments', 'Remixes',
         'Interaction Rate %', 'Remix Rate %', 'Like Rate %',
@@ -6144,17 +6144,20 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           const ownerId = post.ownerId || userId;
           const parentPostId = post.parent_post_id || '';
           const rootPostId = post.root_post_id || '';
+          const remixPostIds = Array.isArray(post.remix_post_ids) && post.remix_post_ids.length > 0
+            ? JSON.stringify(post.remix_post_ids)
+            : '';
           const lastSeen = post.lastSeen ? fmtTimestamp(post.lastSeen) : '';
-          
+
           const snaps = Array.isArray(post.snapshots) ? post.snapshots : [];
           const snapshotCount = snaps.length;
           const firstSnapshot = snaps.length > 0 ? fmtTimestamp(snaps[0]?.t) : '';
           const lastSnapshot = latest ? fmtTimestamp(latest.t) : '';
-          
+
           allLines.push([
             userKey, handle, userId,
             pid, url, postTime, postTimeISO, caption,
-            thumb, parentPostId, rootPostId, lastSeen,
+            thumb, parentPostId, rootPostId, remixPostIds, lastSeen,
             ownerKey, ownerHandle, ownerId,
             latestTime, uv, views, likes, comments, remixes,
             ir != null ? ir.toFixed(2) : '', rr != null ? rr : '', lr != null ? lr.toFixed(2) : '',
@@ -6600,9 +6603,21 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const ownerId = getCol('Owner ID') || userId;
         const parentPostId = getCol('Parent Post ID') || '';
         const rootPostId = getCol('Root Post ID') || '';
+        const remixPostIdsRaw = getCol('Remix Post IDs') || '';
+        let remixPostIds = null;
+        if (remixPostIdsRaw) {
+          try {
+            const parsed = JSON.parse(remixPostIdsRaw);
+            if (Array.isArray(parsed) && parsed.every(v => typeof v === 'string')) {
+              remixPostIds = parsed.length > 0 ? parsed : null;
+            }
+          } catch {
+            // Invalid JSON — ignore silently
+          }
+        }
         const lastSeenISO = getCol('Last Seen Timestamp');
         const lastSeen = parseTimestamp(lastSeenISO);
-        
+
         // Latest snapshot data
         const snapshotTimeISO = getCol('Latest Snapshot Timestamp');
         const snapshotTime = parseTimestamp(snapshotTimeISO);
@@ -6623,6 +6638,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             ownerId: ownerId || null,
             parent_post_id: parentPostId || null,
             root_post_id: rootPostId || null,
+            remix_post_ids: remixPostIds || null,
             lastSeen: lastSeen || null
           };
           stats.postsAdded++;
@@ -6637,6 +6653,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           if (!post.ownerId && ownerId) post.ownerId = ownerId;
           if (!post.parent_post_id && parentPostId) post.parent_post_id = parentPostId;
           if (!post.root_post_id && rootPostId) post.root_post_id = rootPostId;
+          if (!post.remix_post_ids && remixPostIds) post.remix_post_ids = remixPostIds;
           if (!post.lastSeen && lastSeen) post.lastSeen = lastSeen;
           stats.postsUpdated++;
         }

@@ -5936,6 +5936,20 @@ async function renderAnalyzeTable(force = false) {
       const duration = idToDuration.get(id);
       const dimensions = idToDimensions.get(id);
 
+      // Also process remix_posts (child remixes) to make their data available when clicked
+      // remix_posts can be either an array OR an object with items array
+      const remixPostsData = p?.remix_posts || it?.remix_posts;
+      const remixPosts = Array.isArray(remixPostsData)
+        ? remixPostsData
+        : (Array.isArray(remixPostsData?.items) ? remixPostsData.items : []);
+
+      // Extract remix child IDs for the parent payload
+      const remixPostIds = [];
+      for (const remixItem of remixPosts) {
+        const remixId = getItemId(remixItem);
+        if (remixId) remixPostIds.push(remixId);
+      }
+
       batch.push({
         postId: id,
         uv,
@@ -5958,20 +5972,14 @@ async function renderAnalyzeTable(force = false) {
         userKey,
         parent_post_id: p?.parent_post_id ?? null,
         root_post_id: p?.root_post_id ?? null,
+        remix_post_ids: remixPostIds.length > 0 ? remixPostIds : undefined,
         pageUserHandle,
         pageUserKey,
         duration: duration || null,
         width: dimensions?.width || null,
         height: dimensions?.height || null,
       });
-      
-      // Also process remix_posts (child remixes) to make their data available when clicked
-      // remix_posts can be either an array OR an object with items array
-      const remixPostsData = p?.remix_posts || it?.remix_posts;
-      const remixPosts = Array.isArray(remixPostsData) 
-        ? remixPostsData 
-        : (Array.isArray(remixPostsData?.items) ? remixPostsData.items : []);
-      
+
       if (remixPosts.length > 0) {
         for (const remixItem of remixPosts) {
           const remixId = getItemId(remixItem);

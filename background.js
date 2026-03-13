@@ -14,6 +14,7 @@ const TRUSTED_TAB_URL_RE = /^https:\/\/sora\.chatgpt\.com\//i;
 const MAX_MESSAGE_BATCH_ITEMS = 250;
 const MAX_SNAPSHOT_HISTORY_PER_POST = 720;
 const MAX_PROFILE_SERIES_POINTS = 720;
+const MAX_REMIX_POST_IDS_PER_POST = 300;
 
 // Debug toggles
 const DEBUG = { storage: false, thumbs: false };
@@ -82,6 +83,39 @@ function sanitizeCameoUsernames(value) {
   return out;
 }
 
+function sanitizeRemixPostIds(value) {
+  if (!Array.isArray(value)) return null;
+  const seen = new Set();
+  const out = [];
+  for (const raw of value) {
+    if (out.length >= MAX_REMIX_POST_IDS_PER_POST) break;
+    const id = sanitizeIdToken(raw);
+    if (!id) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out.length > 0 ? out : null;
+}
+
+function mergeRemixPostIds(existing, incoming) {
+  const seen = new Set(Array.isArray(existing) ? existing : []);
+  const out = Array.isArray(existing) ? existing.slice() : [];
+  if (Array.isArray(incoming)) {
+    for (const id of incoming) {
+      if (typeof id !== 'string' || !id) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  // Cap: drop oldest from front when over limit
+  if (out.length > MAX_REMIX_POST_IDS_PER_POST) {
+    return out.slice(out.length - MAX_REMIX_POST_IDS_PER_POST);
+  }
+  return out;
+}
+
 function sanitizeMetricsSnapshot(raw) {
   if (!isPlainObject(raw)) return null;
   const snap = {};
@@ -126,6 +160,9 @@ function sanitizeMetricsSnapshot(raw) {
 
   const cameoUsernames = sanitizeCameoUsernames(raw.cameo_usernames);
   if (cameoUsernames) snap.cameo_usernames = cameoUsernames;
+
+  const remixPostIds = sanitizeRemixPostIds(raw.remix_post_ids);
+  if (remixPostIds) snap.remix_post_ids = remixPostIds;
 
   const uv = sanitizeNumber(raw.uv, 0);
   if (uv != null) snap.uv = uv;
@@ -407,6 +444,7 @@ function trimPostForResponse(post, snapshotMode) {
     width: post.width ?? null,
     height: post.height ?? null,
     cameo_usernames: post.cameo_usernames ?? null,
+    remix_post_ids: Array.isArray(post.remix_post_ids) && post.remix_post_ids.length > 0 ? post.remix_post_ids : null,
     snapshots,
   };
 }
@@ -599,6 +637,51 @@ async function flush() {
           // Relationship fields for deriving direct remix counts across metrics
           if (snap.parent_post_id != null && post.parent_post_id !== snap.parent_post_id) { post.parent_post_id = snap.parent_post_id; dirty = true; }
           if (snap.root_post_id != null && post.root_post_id !== snap.root_post_id) { post.root_post_id = snap.root_post_id; dirty = true; }
+
+          // Merge incoming remix_post_ids into the post-level list (dedupe + cap)
+          if (Array.isArray(snap.remix_post_ids) && snap.remix_post_ids.length > 0) {
+            const merged = mergeRemixPostIds(post.remix_post_ids, snap.remix_post_ids);
+            if (!Array.isArray(post.remix_post_ids) || merged.length !== post.remix_post_ids.length ||
+                merged.some((id, i) => id !== post.remix_post_ids[i])) {
+              post.remix_post_ids = merged;
+              dirty = true;
+            }
+          }
+
+          // Reverse-link edge completion: when a remix child is persisted with parent_post_id,
+          // also upsert this post's ID into that parent's remix_post_ids.
+          if (snap.parent_post_id) {
+            const parentUserKey = postIdToUserKey.get(snap.parent_post_id);
+            let parentPost = null;
+            if (parentUserKey && metrics.users[parentUserKey]?.posts?.[snap.parent_post_id]) {
+              parentPost = metrics.users[parentUserKey].posts[snap.parent_post_id];
+            } else {
+              // Search all users for the parent post
+              for (const [uKey, uEntry] of Object.entries(metrics.users)) {
+                if (uEntry?.posts?.[snap.parent_post_id]) {
+                  parentPost = uEntry.posts[snap.parent_post_id];
+                  postIdToUserKey.set(snap.parent_post_id, uKey);
+                  break;
+                }
+              }
+            }
+            if (!parentPost) {
+              // Create a minimal stub for the parent so we can record the edge
+              const stubUserKey = userKey; // attribute stub to the same user bucket
+              if (!metrics.users[stubUserKey]) {
+                metrics.users[stubUserKey] = { handle: null, id: null, posts: {}, followers: [], cameos: [] };
+              }
+              metrics.users[stubUserKey].posts[snap.parent_post_id] = { url: null, thumb: null, snapshots: [] };
+              parentPost = metrics.users[stubUserKey].posts[snap.parent_post_id];
+              postIdToUserKey.set(snap.parent_post_id, stubUserKey);
+              dirty = true;
+            }
+            const currentIds = Array.isArray(parentPost.remix_post_ids) ? parentPost.remix_post_ids : [];
+            if (!currentIds.includes(snap.postId)) {
+              parentPost.remix_post_ids = mergeRemixPostIds(currentIds, [snap.postId]);
+              dirty = true;
+            }
+          }
 
           // IMPORTANT: Always update duration and dimensions at post level when available
           if (snap.duration != null) {
