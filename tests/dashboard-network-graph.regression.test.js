@@ -278,6 +278,40 @@ test('computeRemixNetworkInsights can target a specific source owner within an a
   assert.equal(insights.topRemixers.some((row) => row.ownerKey === 'cara' && row.count === 1), true);
 });
 
+test('computeRemixNetworkInsights keeps normal profile views locked to the selected owner', () => {
+  const { computeRemixNetworkInsights } = buildNetworkHarness();
+  const graph = {
+    nodes: [
+      { id: 'a1', owner: 'alice', isPlaceholder: false },
+      { id: 'b1', owner: 'bob', isPlaceholder: false },
+      { id: 'c1', owner: 'cara', isPlaceholder: false },
+      { id: 'b2', owner: 'bob', isPlaceholder: false },
+      { id: 'd1', owner: 'dave', isPlaceholder: false },
+    ],
+    edges: [
+      { sourceId: 'a1', targetId: 'b1', inferred: false },
+      { sourceId: 'a1', targetId: 'c1', inferred: false },
+      { sourceId: 'b2', targetId: 'd1', inferred: false },
+    ],
+    meta: { selectedPosts: 3 },
+  };
+  const insights = computeRemixNetworkInsights(graph, { handle: 'alice' }, {
+    filteredGraph: graph,
+    sourceOwnerKey: 'bob',
+  });
+  const statsRows = JSON.parse(JSON.stringify(insights.statsRows));
+  assert.deepEqual(statsRows, [
+    ['Filtered Nodes', '5'],
+    ['Filtered Edges', '3'],
+    ['Unique Remixers', '2'],
+    ['Direct Remix Edges', '2'],
+    ['Top Remixer', 'bob (1)'],
+  ]);
+  assert.equal(insights.topRemixers.length, 2);
+  assert.equal(insights.topRemixers.some((row) => row.ownerKey === 'bob' && row.count === 1), true);
+  assert.equal(insights.topRemixers.some((row) => row.ownerKey === 'cara' && row.count === 1), true);
+});
+
 test('buildRemixNetworkForUser honors raised max node caps so remixer targets are retained', () => {
   const { buildRemixNetworkForUser: build } = buildNetworkHarness();
   const user = {

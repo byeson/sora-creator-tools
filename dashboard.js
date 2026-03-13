@@ -3474,10 +3474,11 @@
     const formatOwner = typeof formatNetworkOwnerLabel === 'function'
       ? formatNetworkOwnerLabel
       : (ownerKey)=>String(ownerKey || '');
+    const isAggregateUser = typeof user?.__specialKey === 'string' && !!user.__specialKey;
     const selectedOwner = normalizeCameoName(user?.handle || '');
-    const requestedSourceOwner = normalizeCameoName(opts?.sourceOwnerKey || '');
+    const requestedSourceOwner = isAggregateUser ? normalizeCameoName(opts?.sourceOwnerKey || '') : '';
     const aggregateAllSources = requestedSourceOwner === '*'
-      || (!requestedSourceOwner && typeof user?.__specialKey === 'string' && !!user.__specialKey);
+      || (!requestedSourceOwner && isAggregateUser);
     const activeSourceOwner = requestedSourceOwner || selectedOwner;
     const nodeById = new Map((graph?.nodes || []).map((node)=>[node.id, node]));
     const remixerMap = new Map();
@@ -11257,31 +11258,35 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         bodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view remixers.</td></tr>';
         return;
       }
+      const isAggregateUser = typeof user?.__specialKey === 'string' && !!user.__specialKey;
       const selectedOwner = normalizeCameoName(user?.handle || '');
-      const sourceOwners = collectRemixSourceOwners(graph);
-      const defaultFilter = (typeof user?.__specialKey === 'string' && !!user.__specialKey) ? 'all' : 'selected';
+      const sourceOwners = isAggregateUser ? collectRemixSourceOwners(graph) : [];
+      const defaultFilter = isAggregateUser ? 'all' : 'selected';
       const nextOptions = [];
       const optionHtml = [];
-      if (defaultFilter === 'all') {
+      if (isAggregateUser) {
         nextOptions.push('all');
         optionHtml.push('<option value="all">All Visible Users</option>');
       } else {
         nextOptions.push('selected');
         optionHtml.push('<option value="selected">Selected Profile</option>');
       }
-      for (const [ownerKey] of sourceOwners) {
-        if (!ownerKey) continue;
-        if (defaultFilter !== 'all' && ownerKey === selectedOwner) continue;
-        const value = `user:${ownerKey}`;
-        nextOptions.push(value);
-        optionHtml.push(`<option value="${esc(value)}">${esc(formatNetworkOwnerLabel(ownerKey))}</option>`);
+      if (isAggregateUser) {
+        for (const [ownerKey] of sourceOwners) {
+          if (!ownerKey) continue;
+          const value = `user:${ownerKey}`;
+          nextOptions.push(value);
+          optionHtml.push(`<option value="${esc(value)}">${esc(formatNetworkOwnerLabel(ownerKey))}</option>`);
+        }
       }
       selectEl.innerHTML = optionHtml.join('');
       if (!nextOptions.includes(topRemixersOwnerFilter)) topRemixersOwnerFilter = defaultFilter;
       selectEl.value = topRemixersOwnerFilter;
-      const sourceOwnerKey = topRemixersOwnerFilter === 'all'
+      selectEl.disabled = !isAggregateUser;
+      selectEl.classList.toggle('is-hidden', !isAggregateUser);
+      const sourceOwnerKey = (isAggregateUser && topRemixersOwnerFilter === 'all')
         ? '*'
-        : (topRemixersOwnerFilter.startsWith('user:') ? topRemixersOwnerFilter.slice(5) : '');
+        : ((isAggregateUser && topRemixersOwnerFilter.startsWith('user:')) ? topRemixersOwnerFilter.slice(5) : '');
       const insights = computeRemixNetworkInsights(graph, user, {
         filteredGraph: graph,
         sourceOwnerKey
@@ -11290,10 +11295,12 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const uniqueRemixers = insights?.statsRows?.[2]?.[1] || '0';
       const directRemixEdges = insights?.statsRows?.[3]?.[1] || '0';
       const visiblePosts = Number(graph?.meta?.selectedPosts) || 0;
-      const scopeLabel = topRemixersOwnerFilter === 'all'
+      const scopeLabel = !isAggregateUser
+        ? (selectedOwner ? formatNetworkOwnerLabel(selectedOwner) : 'selected profile')
+        : topRemixersOwnerFilter === 'all'
         ? 'all visible users'
         : (topRemixersOwnerFilter.startsWith('user:')
-          ? `@${formatNetworkOwnerLabel(topRemixersOwnerFilter.slice(5))}`
+          ? formatNetworkOwnerLabel(topRemixersOwnerFilter.slice(5))
           : 'selected profile');
       statsEl.textContent = `${uniqueRemixers} remixers • ${directRemixEdges} remixes • ${fmt(visiblePosts)} visible posts • ${scopeLabel}`;
       if (!topRemixers.length) {
