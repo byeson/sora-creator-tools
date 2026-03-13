@@ -351,29 +351,6 @@
           </div>
         </div>
       </div>
-      <div class="chart-block remix-remixers-block">
-        <div class="chart-header">
-          <h4 class="chart-title">Top Remixers</h4>
-          <select id="topRemixersOwnerFilter" class="network-owner-filter" title="Filter Top Remixers by source user">
-            <option value="selected">Selected Profile</option>
-          </select>
-        </div>
-        <div id="topRemixersStats" class="remix-remixers-meta">No remix data</div>
-        <div class="remix-remixers-card">
-          <table class="remix-remixers-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>User</th>
-                <th>Remix Count</th>
-              </tr>
-            </thead>
-            <tbody id="topRemixersBody">
-              <tr><td colspan="3">Select a profile to view remixers.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
       <h3 class="section-title section-title-compare">Compare Total Metrics</h3>
       <p class="section-note">You must run Gather mode on any profile for up-to-date and complete data</p>
       <div class="compare-section">
@@ -447,6 +424,30 @@
         <div class="chart-y-axis-label">Cast In</div>
         <canvas id="cameosChart" width="900" height="540"></canvas>
         <div id="cameosTooltip" class="tooltip"></div>
+      </div>
+
+      <div class="chart-block remix-remixers-block">
+        <div class="chart-header">
+          <h4 class="chart-title">Top Remixers</h4>
+          <select id="topRemixersOwnerFilter" class="network-owner-filter" title="Filter Top Remixers by source user">
+            <option value="selected">Selected Profile</option>
+          </select>
+        </div>
+        <div id="topRemixersStats" class="remix-remixers-meta">No remix data</div>
+        <div class="remix-remixers-card">
+          <table class="remix-remixers-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>User</th>
+                <th>Remix Count</th>
+              </tr>
+            </thead>
+            <tbody id="topRemixersBody">
+              <tr><td colspan="3">Select a profile to view remixers.</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <div class="brought-by">
