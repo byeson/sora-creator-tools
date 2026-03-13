@@ -7975,8 +7975,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     let allViewsChart = makeTimeChart($('#allViewsChart'), '#allViewsTooltip', 'Total Views', fmt2);
     const allLikesChart = makeTimeChart($('#allLikesChart'), '#allLikesTooltip', 'Likes', fmt2);
     const cameosChart = makeTimeChart($('#cameosChart'), '#cameosTooltip', 'Cast in', fmt2);
-    const remixNetworkCanvas = $('#remixNetworkCanvas');
-    const remixNetworkChart = remixNetworkCanvas ? makeRemixNetworkChart(remixNetworkCanvas, '#remixNetworkTooltip') : null;
+    const remixNetworkChart = null;
     const PRESET_VISIBILITY_ACTIONS = new Set([
       'pastDay',
       'pastWeek',
@@ -12250,8 +12249,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           '#likesPerMinuteTimeTooltip',
           '#likesPerMinuteTooltip',
           '#viewsPerMinuteTimeTooltip',
-          '#viewsPerMinuteTooltip',
-          '#remixNetworkTooltip'
+          '#viewsPerMinuteTooltip'
         ]);
         if (isStacked) ensureStackedWindowHasData();
         syncViewsHeaders();
@@ -12272,37 +12270,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const chartModeStackedBtn = $('#chartModeStacked');
     if (chartModeLinearBtn) chartModeLinearBtn.addEventListener('click', ()=> setGlobalChartMode('linear'));
     if (chartModeStackedBtn) chartModeStackedBtn.addEventListener('click', ()=> setGlobalChartMode('stacked'));
-    const networkModeVisibleBtn = $('#networkModeVisible');
-    const networkModeAllBtn = $('#networkModeAll');
-    const networkSizeRemixesBtn = $('#networkSizeRemixes');
-    const networkSizeLikesBtn = $('#networkSizeLikes');
-    const networkSizeViewsBtn = $('#networkSizeViews');
-    const networkLabelsOffBtn = $('#networkLabelsOff');
-    const networkLabelsSparseBtn = $('#networkLabelsSparse');
-    const networkLabelsAllBtn = $('#networkLabelsAll');
-    const networkOwnerFilterSelect = $('#networkOwnerFilter');
     const topRemixersOwnerFilterSelect = $('#topRemixersOwnerFilter');
-    const remixNetworkResetBtn = $('#remixNetworkResetView');
-    const remixNetworkCenterBtn = $('#remixNetworkCenterSelection');
-    if (networkModeVisibleBtn) networkModeVisibleBtn.addEventListener('click', ()=> setNetworkMode('visible'));
-    if (networkModeAllBtn) networkModeAllBtn.addEventListener('click', ()=> setNetworkMode('all'));
-    if (networkSizeRemixesBtn) networkSizeRemixesBtn.addEventListener('click', ()=> setNetworkSizeMetric('remixes'));
-    if (networkSizeLikesBtn) networkSizeLikesBtn.addEventListener('click', ()=> setNetworkSizeMetric('likes'));
-    if (networkSizeViewsBtn) networkSizeViewsBtn.addEventListener('click', ()=> setNetworkSizeMetric('views'));
-    if (networkLabelsOffBtn) networkLabelsOffBtn.addEventListener('click', ()=> setNetworkLabelDensity('off'));
-    if (networkLabelsSparseBtn) networkLabelsSparseBtn.addEventListener('click', ()=> setNetworkLabelDensity('sparse'));
-    if (networkLabelsAllBtn) networkLabelsAllBtn.addEventListener('click', ()=> setNetworkLabelDensity('all'));
-    if (networkOwnerFilterSelect) networkOwnerFilterSelect.addEventListener('change', (e)=> setNetworkOwnerFilter(e.target.value));
     if (topRemixersOwnerFilterSelect) topRemixersOwnerFilterSelect.addEventListener('change', (e)=>{
       topRemixersOwnerFilter = typeof e?.target?.value === 'string' ? e.target.value : 'selected';
       updateRemixNetworkShell(resolveUserForKey(metrics, currentUserKey), visibleSet);
-    });
-    if (remixNetworkChart && remixNetworkResetBtn) remixNetworkResetBtn.addEventListener('click', ()=> remixNetworkChart.resetView());
-    if (remixNetworkChart && remixNetworkCenterBtn) remixNetworkCenterBtn.addEventListener('click', ()=> remixNetworkChart.centerSelection());
-    if (remixNetworkChart) remixNetworkChart.onSelect((postId)=>{
-      networkSelectionPostId = typeof postId === 'string' && postId ? postId : null;
-      remixNetworkChart.setHighlight(networkSelectionPostId);
-      updateNetworkCenterButtonState();
     });
     syncNetworkControls();
     applyStackedWindowDefaults();

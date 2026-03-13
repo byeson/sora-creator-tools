@@ -394,6 +394,9 @@ test('background flush: remix child with parent_post_id backfills parent remix_p
   const sanitizerStart = src.indexOf('function isPlainObject(value) {');
   const sanitizerEnd = src.indexOf('function sanitizeMetricsBatch(items) {', sanitizerStart);
   const sanitizerBlock = src.slice(sanitizerStart, sanitizerEnd);
+  const resolveKeyStart = src.indexOf('function resolveIncomingUserKey(metrics, snap) {');
+  const resolveKeyEnd = src.indexOf('function shouldPersistFollowerCount(series, nextCount) {', resolveKeyStart);
+  const resolveIncomingUserKeyBlock = src.slice(resolveKeyStart, resolveKeyEnd);
 
   // Extract mergeRemixPostIds (already in sanitizer block range above)
 
@@ -445,6 +448,7 @@ test('background flush: remix child with parent_post_id backfills parent remix_p
     const DEBUG = { storage: false, thumbs: false };
     function dlog() {}
     function trimSeriesInPlace() {}
+    ${resolveIncomingUserKeyBlock}
     const coldSnapshotBuffer = new Map();
     const coldDirtyUsers = new Set();
     const postIdToUserKey = globalThis.__postIdToUserKey;
@@ -481,6 +485,9 @@ test('background flush: edge completion creates minimal parent stub when parent 
   const sanitizerStart = src.indexOf('function isPlainObject(value) {');
   const sanitizerEnd = src.indexOf('function sanitizeMetricsBatch(items) {', sanitizerStart);
   const sanitizerBlock = src.slice(sanitizerStart, sanitizerEnd);
+  const resolveKeyStart = src.indexOf('function resolveIncomingUserKey(metrics, snap) {');
+  const resolveKeyEnd = src.indexOf('function shouldPersistFollowerCount(series, nextCount) {', resolveKeyStart);
+  const resolveIncomingUserKeyBlock = src.slice(resolveKeyStart, resolveKeyEnd);
 
   const flushLoopStart = src.indexOf('      for (const snap of items) {');
   const flushLoopEnd = src.indexOf('\n      if (!dirty) {', flushLoopStart);
@@ -524,6 +531,7 @@ test('background flush: edge completion creates minimal parent stub when parent 
     const DEBUG = { storage: false, thumbs: false };
     function dlog() {}
     function trimSeriesInPlace() {}
+    ${resolveIncomingUserKeyBlock}
     const coldSnapshotBuffer = new Map();
     const coldDirtyUsers = new Set();
     const postIdToUserKey = globalThis.__postIdToUserKey;

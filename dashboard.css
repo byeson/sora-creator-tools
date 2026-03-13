@@ -1058,12 +1058,6 @@ body.is-resizing{cursor:col-resize;user-select:none}
   gap:8px;
   flex-wrap:wrap;
 }
-.remix-network-controls{
-  gap:6px;
-}
-.remix-network-controls button{
-  white-space:nowrap;
-}
 .network-owner-filter{
   min-width:170px;
   max-width:220px;
