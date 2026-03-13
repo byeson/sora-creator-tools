@@ -213,6 +213,26 @@ function trimSeriesInPlace(arr, maxPoints = MAX_PROFILE_SERIES_POINTS) {
   arr.splice(0, arr.length - maxPoints);
 }
 
+function resolveIncomingUserKey(metrics, snap) {
+  const handle = typeof snap?.userHandle === 'string' && snap.userHandle
+    ? snap.userHandle.toLowerCase()
+    : (typeof snap?.pageUserHandle === 'string' && snap.pageUserHandle ? snap.pageUserHandle.toLowerCase() : '');
+  if (handle) return `h:${handle}`;
+
+  const rawUserId = snap?.userId;
+  const userId = rawUserId != null ? String(rawUserId) : '';
+  if (userId && metrics?.users && typeof metrics.users === 'object') {
+    for (const [key, user] of Object.entries(metrics.users)) {
+      if (!user) continue;
+      if (user.id != null && String(user.id) === userId) {
+        return key;
+      }
+    }
+  }
+
+  return snap?.userKey || snap?.pageUserKey || 'unknown';
+}
+
 function normalizeMetrics(raw) {
   if (!raw || typeof raw !== 'object') return { ...DEFAULT_METRICS };
   const users = raw.users;
@@ -526,11 +546,13 @@ async function flush() {
       let dirty = false;
       const touchedPosts = new Set();
       for (const snap of items) {
-        const userKey = snap.userKey || snap.pageUserKey || 'unknown';
+        const userKey = resolveIncomingUserKey(metrics, snap);
         if (!metrics.users[userKey]) {
           dirty = true;
         }
         const userEntry = metrics.users[userKey] || (metrics.users[userKey] = { handle: snap.userHandle || snap.pageUserHandle || null, id: snap.userId || null, posts: {}, followers: [], cameos: [] });
+        if (!userEntry.handle && (snap.userHandle || snap.pageUserHandle)) userEntry.handle = snap.userHandle || snap.pageUserHandle || null;
+        if (userEntry.id == null && snap.userId != null) userEntry.id = snap.userId;
         if (!userEntry.posts || typeof userEntry.posts !== 'object' || Array.isArray(userEntry.posts)) userEntry.posts = {};
         if (!Array.isArray(userEntry.followers)) userEntry.followers = [];
         if (snap.postId) {
