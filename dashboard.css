@@ -1087,6 +1087,20 @@ body.is-resizing{cursor:col-resize;user-select:none}
 .remix-remixers-block .chart-header{
   gap:12px;
 }
+.mailbox-activity-grid{
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:12px;
+}
+.mailbox-activity-card-title{
+  margin:0 0 8px;
+  color:rgba(255,255,255,0.72);
+  font-size:11px;
+  font-weight:700;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+  font-family:var(--font-system);
+}
 .remix-remixers-card{
   border:1px solid rgba(255,255,255,0.1);
   border-radius:14px;
@@ -1127,6 +1141,11 @@ body.is-resizing{cursor:col-resize;user-select:none}
 }
 .remix-remixers-table tr:last-child td{
   border-bottom:0;
+}
+@media (max-width: 840px){
+  .mailbox-activity-grid{
+    grid-template-columns:1fr;
+  }
 }
 .section-note,
 .best-time-subtitle{

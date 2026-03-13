@@ -15,6 +15,8 @@ const MAX_MESSAGE_BATCH_ITEMS = 250;
 const MAX_SNAPSHOT_HISTORY_PER_POST = 720;
 const MAX_PROFILE_SERIES_POINTS = 720;
 const MAX_REMIX_POST_IDS_PER_POST = 300;
+const MAX_MAILBOX_EVENTS_PER_POST = 200;
+const MAX_EVENT_ID_LEN = 256;
 
 // Debug toggles
 const DEBUG = { storage: false, thumbs: false };
@@ -116,6 +118,69 @@ function mergeRemixPostIds(existing, incoming) {
   return out;
 }
 
+function sanitizeMailboxActorEvent(raw) {
+  if (!isPlainObject(raw)) return null;
+  const actorHandle = sanitizeString(raw.actorHandle, 80);
+  const actorId = sanitizeUserId(raw.actorId);
+  let actorKey = sanitizeIdToken(raw.actorKey);
+  if (!actorKey && actorHandle) actorKey = `h:${actorHandle.toLowerCase()}`;
+  if (!actorKey && actorId != null) actorKey = `id:${String(actorId)}`;
+  if (!actorKey) return null;
+  const eventId = sanitizeIdToken(raw.eventId, MAX_EVENT_ID_LEN);
+  const ts = sanitizeNumber(raw.ts, 0);
+  const out = { actorKey };
+  if (actorHandle) out.actorHandle = actorHandle;
+  if (actorId != null) out.actorId = actorId;
+  if (eventId) out.eventId = eventId;
+  if (ts != null) out.ts = ts;
+  return out;
+}
+
+function sanitizeMailboxActorEvents(value) {
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  const seen = new Set();
+  for (const raw of value) {
+    if (out.length >= MAX_MAILBOX_EVENTS_PER_POST) break;
+    const event = sanitizeMailboxActorEvent(raw);
+    if (!event) continue;
+    const dedupeKey = event.eventId || `${event.actorKey}:${event.ts || 0}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(event);
+  }
+  return out.length > 0 ? out : null;
+}
+
+function mergeMailboxActorEvents(existing, incoming) {
+  const merged = new Map();
+  const mergeIn = (list) => {
+    for (const raw of Array.isArray(list) ? list : []) {
+      const event = sanitizeMailboxActorEvent(raw);
+      if (!event) continue;
+      const key = event.eventId || `${event.actorKey}:${event.ts || 0}`;
+      const prev = merged.get(key);
+      if (!prev) {
+        merged.set(key, { ...event });
+        continue;
+      }
+      merged.set(key, {
+        ...prev,
+        ...event,
+        actorHandle: event.actorHandle || prev.actorHandle || null,
+        actorId: event.actorId != null ? event.actorId : (prev.actorId ?? null),
+        ts: Math.max(Number(prev.ts) || 0, Number(event.ts) || 0) || null
+      });
+    }
+  };
+  mergeIn(existing);
+  mergeIn(incoming);
+  const out = Array.from(merged.values());
+  out.sort((a, b) => (Number(b?.ts) || 0) - (Number(a?.ts) || 0));
+  if (out.length > MAX_MAILBOX_EVENTS_PER_POST) return out.slice(0, MAX_MAILBOX_EVENTS_PER_POST);
+  return out;
+}
+
 function sanitizeMetricsSnapshot(raw) {
   if (!isPlainObject(raw)) return null;
   const snap = {};
@@ -163,6 +228,10 @@ function sanitizeMetricsSnapshot(raw) {
 
   const remixPostIds = sanitizeRemixPostIds(raw.remix_post_ids);
   if (remixPostIds) snap.remix_post_ids = remixPostIds;
+  const mailboxLikes = sanitizeMailboxActorEvents(raw.mailbox_likes);
+  if (mailboxLikes) snap.mailbox_likes = mailboxLikes;
+  const mailboxComments = sanitizeMailboxActorEvents(raw.mailbox_comments);
+  if (mailboxComments) snap.mailbox_comments = mailboxComments;
 
   const uv = sanitizeNumber(raw.uv, 0);
   if (uv != null) snap.uv = uv;
@@ -445,6 +514,8 @@ function trimPostForResponse(post, snapshotMode) {
     height: post.height ?? null,
     cameo_usernames: post.cameo_usernames ?? null,
     remix_post_ids: Array.isArray(post.remix_post_ids) && post.remix_post_ids.length > 0 ? post.remix_post_ids : null,
+    mailbox_likes: Array.isArray(post.mailbox_likes) && post.mailbox_likes.length > 0 ? post.mailbox_likes : null,
+    mailbox_comments: Array.isArray(post.mailbox_comments) && post.mailbox_comments.length > 0 ? post.mailbox_comments : null,
     snapshots,
   };
 }
@@ -644,6 +715,38 @@ async function flush() {
             if (!Array.isArray(post.remix_post_ids) || merged.length !== post.remix_post_ids.length ||
                 merged.some((id, i) => id !== post.remix_post_ids[i])) {
               post.remix_post_ids = merged;
+              dirty = true;
+            }
+          }
+          if (Array.isArray(snap.mailbox_likes) && snap.mailbox_likes.length > 0) {
+            const merged = mergeMailboxActorEvents(post.mailbox_likes, snap.mailbox_likes);
+            const prev = Array.isArray(post.mailbox_likes) ? post.mailbox_likes : [];
+            if (merged.length !== prev.length || merged.some((event, i) => {
+              const before = prev[i];
+              return !before
+                || before.eventId !== event.eventId
+                || before.actorKey !== event.actorKey
+                || before.actorHandle !== event.actorHandle
+                || before.actorId !== event.actorId
+                || before.ts !== event.ts;
+            })) {
+              post.mailbox_likes = merged;
+              dirty = true;
+            }
+          }
+          if (Array.isArray(snap.mailbox_comments) && snap.mailbox_comments.length > 0) {
+            const merged = mergeMailboxActorEvents(post.mailbox_comments, snap.mailbox_comments);
+            const prev = Array.isArray(post.mailbox_comments) ? post.mailbox_comments : [];
+            if (merged.length !== prev.length || merged.some((event, i) => {
+              const before = prev[i];
+              return !before
+                || before.eventId !== event.eventId
+                || before.actorKey !== event.actorKey
+                || before.actorHandle !== event.actorHandle
+                || before.actorId !== event.actorId
+                || before.ts !== event.ts;
+            })) {
+              post.mailbox_comments = merged;
               dirty = true;
             }
           }

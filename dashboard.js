@@ -2008,6 +2008,31 @@
     }
     return merged;
   }
+  function mergeMailboxActorEventsForDashboard(existing, incoming){
+    const merged = new Map();
+    const mergeIn = (list)=>{
+      for (const raw of (Array.isArray(list) ? list : [])) {
+        if (!raw || typeof raw !== 'object') continue;
+        const actorKey = typeof raw.actorKey === 'string' && raw.actorKey ? raw.actorKey : '';
+        if (!actorKey) continue;
+        const ts = toTs(raw.ts) || 0;
+        const eventId = typeof raw.eventId === 'string' && raw.eventId ? raw.eventId : '';
+        const key = eventId || `${actorKey}:${ts}`;
+        const prev = merged.get(key);
+        const next = {
+          actorKey,
+          actorHandle: typeof raw.actorHandle === 'string' && raw.actorHandle ? raw.actorHandle : (prev?.actorHandle || null),
+          actorId: raw.actorId != null ? raw.actorId : (prev?.actorId ?? null),
+          eventId: eventId || (prev?.eventId || null),
+          ts: Math.max(Number(prev?.ts) || 0, ts) || null
+        };
+        merged.set(key, next);
+      }
+    };
+    mergeIn(existing);
+    mergeIn(incoming);
+    return Array.from(merged.values()).sort((a, b)=> (Number(b?.ts) || 0) - (Number(a?.ts) || 0));
+  }
   function buildMergedIdentityUser(metrics, userKey, user = null){
     const resolvedUser = user || resolveUserForKey(metrics, userKey);
     if (!resolvedUser || isVirtualUserKey(userKey)) {
@@ -2078,6 +2103,12 @@
         if (Array.isArray(source?.cameo_usernames) && source.cameo_usernames.length) {
           const left = Array.isArray(merged.cameo_usernames) ? merged.cameo_usernames : [];
           merged.cameo_usernames = Array.from(new Set(left.concat(source.cameo_usernames).filter(Boolean)));
+        }
+        if (Array.isArray(source?.mailbox_likes) && source.mailbox_likes.length) {
+          merged.mailbox_likes = mergeMailboxActorEventsForDashboard(merged.mailbox_likes, source.mailbox_likes);
+        }
+        if (Array.isArray(source?.mailbox_comments) && source.mailbox_comments.length) {
+          merged.mailbox_comments = mergeMailboxActorEventsForDashboard(merged.mailbox_comments, source.mailbox_comments);
         }
       }
       mergedPosts[pid] = merged;
@@ -3254,6 +3285,87 @@
     const clean = (typeof text === 'string' ? text.trim() : '') || 'this post';
     if (clean.length <= 100) return clean;
     return clean.slice(0, 100) + '...';
+  }
+
+  function formatMailboxActorLabel(actor){
+    const handle = normalizeCameoName(actor?.actorHandle || '');
+    if (handle) return `@${handle}`;
+    const actorKey = typeof actor?.actorKey === 'string' ? actor.actorKey : '';
+    if (actorKey.startsWith('h:')) return `@${actorKey.slice(2)}`;
+    if (actorKey.startsWith('id:')) return actorKey;
+    return actorKey || 'Unknown';
+  }
+
+  function computeMailboxActivityInsights(user, visibleSet){
+    const posts = (user && user.posts && typeof user.posts === 'object') ? user.posts : {};
+    const likeActors = new Map();
+    const commentActors = new Map();
+    let matchedPosts = 0;
+    let postsWithMailboxEvents = 0;
+    const consume = (bucket, list)=>{
+      for (const event of (Array.isArray(list) ? list : [])) {
+        if (!event || typeof event !== 'object') continue;
+        const dedupeKey = typeof event.eventId === 'string' && event.eventId
+          ? event.eventId
+          : `${event.actorKey || ''}:${toTs(event.ts) || 0}`;
+        if (!dedupeKey) continue;
+        let entry = bucket.get(dedupeKey);
+        if (!entry) {
+          entry = {
+            actorKey: typeof event.actorKey === 'string' && event.actorKey ? event.actorKey : '',
+            actorHandle: typeof event.actorHandle === 'string' && event.actorHandle ? event.actorHandle : null,
+            actorId: event.actorId ?? null,
+            ts: toTs(event.ts) || 0
+          };
+          bucket.set(dedupeKey, entry);
+        } else if ((toTs(event.ts) || 0) > (entry.ts || 0)) {
+          entry.ts = toTs(event.ts) || entry.ts || 0;
+          if (!entry.actorHandle && typeof event.actorHandle === 'string' && event.actorHandle) entry.actorHandle = event.actorHandle;
+          if (entry.actorId == null && event.actorId != null) entry.actorId = event.actorId;
+        }
+      }
+    };
+    for (const [pid, post] of Object.entries(posts)) {
+      if (visibleSet && typeof visibleSet.has === 'function' && !visibleSet.has(pid)) continue;
+      matchedPosts++;
+      const likeList = Array.isArray(post?.mailbox_likes) ? post.mailbox_likes : [];
+      const commentList = Array.isArray(post?.mailbox_comments) ? post.mailbox_comments : [];
+      if (likeList.length || commentList.length) postsWithMailboxEvents++;
+      consume(likeActors, likeList);
+      consume(commentActors, commentList);
+    }
+    const aggregate = (bucket)=>{
+      const byActor = new Map();
+      for (const entry of bucket.values()) {
+        const actorKey = entry.actorKey || '';
+        if (!actorKey) continue;
+        const existing = byActor.get(actorKey) || {
+          actorKey,
+          actorHandle: entry.actorHandle || null,
+          actorId: entry.actorId ?? null,
+          count: 0,
+          lastTs: 0
+        };
+        existing.count += 1;
+        if (!existing.actorHandle && entry.actorHandle) existing.actorHandle = entry.actorHandle;
+        if (existing.actorId == null && entry.actorId != null) existing.actorId = entry.actorId;
+        existing.lastTs = Math.max(existing.lastTs || 0, entry.ts || 0);
+        byActor.set(actorKey, existing);
+      }
+      return Array.from(byActor.values()).sort((a, b)=> {
+        const dc = (b.count || 0) - (a.count || 0);
+        if (dc !== 0) return dc;
+        const dt = (b.lastTs || 0) - (a.lastTs || 0);
+        if (dt !== 0) return dt;
+        return formatMailboxActorLabel(a).localeCompare(formatMailboxActorLabel(b));
+      });
+    };
+    return {
+      matchedPosts,
+      postsWithMailboxEvents,
+      topLikers: aggregate(likeActors),
+      topCommenters: aggregate(commentActors)
+    };
   }
 
   function buildRemixNetworkForUser(user, visibleSet, opts = {}){
@@ -11320,6 +11432,41 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       }).join('');
     }
 
+    function renderMailboxActivityPanel(user, visibleIds){
+      const statsEl = $('#mailboxActivityStats');
+      const likersBodyEl = $('#topMailboxLikersBody');
+      const commentersBodyEl = $('#topMailboxCommentersBody');
+      if (!statsEl || !likersBodyEl || !commentersBodyEl) return;
+      if (!user || !user.posts) {
+        statsEl.textContent = 'No mailbox activity';
+        likersBodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view likers.</td></tr>';
+        commentersBodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view commenters.</td></tr>';
+        return;
+      }
+      const insights = computeMailboxActivityInsights(user, visibleIds);
+      const topLikers = Array.isArray(insights?.topLikers) ? insights.topLikers : [];
+      const topCommenters = Array.isArray(insights?.topCommenters) ? insights.topCommenters : [];
+      const selectedOwner = normalizeCameoName(user?.handle || '');
+      const scopeLabel = isVirtualUser(user)
+        ? 'all visible users'
+        : (selectedOwner ? formatNetworkOwnerLabel(selectedOwner) : 'selected profile');
+      statsEl.textContent = `${fmt(topLikers.length)} likers • ${fmt(topCommenters.length)} commenters • ${fmt(insights?.matchedPosts || 0)} visible posts • ${scopeLabel} • mailbox`;
+      const renderRows = (rows, valueLabel)=>{
+        if (!rows.length) return `<tr><td colspan="3">No ${valueLabel.toLowerCase()} captured from mailbox yet.</td></tr>`;
+        return rows.slice(0, 15).map((row, idx)=>{
+          const actorLabel = esc(formatMailboxActorLabel(row));
+          const actorHandle = normalizeCameoName(row?.actorHandle || '');
+          const profileUrl = actorHandle ? `${SITE_ORIGIN}/profile/${encodeURIComponent(actorHandle)}` : '';
+          const actorCell = profileUrl
+            ? `<a class="remix-remixers-user-link" href="${esc(profileUrl)}" target="_blank" rel="noopener">${actorLabel}</a>`
+            : actorLabel;
+          return `<tr><td>${idx + 1}</td><td>${actorCell}</td><td>${fmt(row.count)}</td></tr>`;
+        }).join('');
+      };
+      likersBodyEl.innerHTML = renderRows(topLikers, 'Likes');
+      commentersBodyEl.innerHTML = renderRows(topCommenters, 'Comments');
+    }
+
     function refreshNetworkOwnerFilterOptions(baseGraph, user){
       const select = $('#networkOwnerFilter');
       if (!select) return [];
@@ -11570,6 +11717,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           panelStatsEl.textContent = 'No remix data';
           panelBodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view remixers.</td></tr>';
         }
+        renderMailboxActivityPanel(null, visibleIds);
         if (!remixNetworkChart) return;
         networkSelectionPostId = null;
         networkOwnerFilter = NETWORK_OWNER_FILTER_DEFAULT;
@@ -11605,6 +11753,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         resolvePostById: getRemixNetworkPostResolver()
       });
       renderTopRemixersPanel(baseGraph, user);
+      renderMailboxActivityPanel(user, visibleIds);
       if (!remixNetworkChart) return;
       const networkGraph = buildRemixNetworkForUser(user, visibleIds, {
         mode: networkMode,

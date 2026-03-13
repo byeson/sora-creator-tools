@@ -48,6 +48,7 @@
   const FEED_RE = /\/(backend\/project_[a-z]+\/)?(feed|profile_feed|profile\/)/i;
   const DRAFTS_RE = /\/(backend\/project_[a-z]+\/)?profile\/drafts($|\/|\?)/i;
   const CHARACTERS_RE = /\/(backend\/project_[a-z]+\/)?profile\/[^/]+\/characters($|\?)/i;
+  const MAILBOX_RE = /\/backend\/project_[a-z]+\/mailbox(?:$|\?)/i;
   const NF_CREATE_RE = /\/backend\/nf\/create/i;
   const NF_PENDING_V2_RE = /\/backend\/nf\/pending\/v2/i;
   const POST_DETAIL_RE = /\/(backend\/project_[a-z]+\/)?posts?\/[^/]+(\/(tree|children|ancestors|remix_posts|remixes))?(\?|$)/i;
@@ -5544,6 +5545,10 @@ async function renderAnalyzeTable(force = false) {
           res.clone().json().then(processDraftsJson).catch((err) => {
             console.error('[SoraUV] Error parsing drafts fetch response:', err);
           });
+        } else if (MAILBOX_RE.test(url)) {
+          res.clone().json().then(processMailboxJson).catch((err) => {
+            console.error('[SoraUV] Error parsing mailbox fetch response:', err);
+          });
         } else if (FEED_RE.test(url)) {
           dlog('feed', 'fetch matched', { url });
           res
@@ -5632,6 +5637,12 @@ async function renderAnalyzeTable(force = false) {
                 processDraftsJson(JSON.parse(this.responseText));
               } catch (err) {
                 console.error('[SoraUV] Error parsing drafts XHR:', err);
+              }
+            } else if (MAILBOX_RE.test(url)) {
+              try {
+                processMailboxJson(JSON.parse(this.responseText));
+              } catch (err) {
+                console.error('[SoraUV] Error parsing mailbox XHR:', err);
               }
             } else if (FEED_RE.test(url)) {
               dlog('feed', 'xhr matched', { url });
@@ -5731,6 +5742,86 @@ async function renderAnalyzeTable(force = false) {
     const pageUserKey = pageUserHandle ? `h:${pageUserHandle.toLowerCase()}` : 'unknown';
     const batch = [];
     queueProfileSnapshot(batch, json, pageUserHandle, pageUserKey);
+    if (batch.length) {
+      try {
+        window.postMessage({ __sora_uv__: true, type: 'metrics_batch', items: batch }, '*');
+      } catch {}
+    }
+  }
+
+  function classifyMailboxEventType(item) {
+    const kind = String(item?.kind || '').trim().toLowerCase();
+    const display = String(item?.display_str || '').trim().toLowerCase();
+    if (kind.includes('comment') || kind.includes('reply') || display.includes('commented') || display.includes('replied')) {
+      return 'comment';
+    }
+    if (kind.includes('like')) return 'like';
+    if (kind.includes('remix') || display.includes('remixed')) return 'remix';
+    return null;
+  }
+
+  function extractMailboxActorEvents(item) {
+    const profiles = Array.isArray(item?.profiles) ? item.profiles : [];
+    if (!profiles.length) return [];
+    const rawTs = Number(item?.ts);
+    const ts = Number.isFinite(rawTs) ? (rawTs < 1e11 ? rawTs * 1000 : rawTs) : Date.now();
+    const eventIdBase = typeof item?.id === 'string' && item.id ? item.id : '';
+    const out = [];
+    const seen = new Set();
+    for (const profile of profiles) {
+      if (!profile || typeof profile !== 'object') continue;
+      const actorHandle = typeof profile.username === 'string' && profile.username ? profile.username : null;
+      const actorId = profile.user_id || profile.id || null;
+      const actorKey = actorHandle
+        ? `h:${actorHandle.toLowerCase()}`
+        : (actorId ? `id:${String(actorId)}` : null);
+      if (!actorKey || seen.has(actorKey)) continue;
+      seen.add(actorKey);
+      out.push({
+        eventId: eventIdBase ? `${eventIdBase}:${actorKey}` : null,
+        actorKey,
+        actorHandle,
+        actorId,
+        ts
+      });
+    }
+    return out;
+  }
+
+  function processMailboxJson(json) {
+    const items = Array.isArray(json?.items) ? json.items : [];
+    if (!items.length) return;
+    const feedItems = [];
+    const batch = [];
+    for (const item of items) {
+      const post = item?.object?.kind === 'post' ? item.object?.post : null;
+      if (!post || typeof post !== 'object' || !post.id) continue;
+      feedItems.push({ post });
+      const eventType = classifyMailboxEventType(item);
+      if (eventType !== 'like' && eventType !== 'comment') continue;
+      const actorEvents = extractMailboxActorEvents(item);
+      if (!actorEvents.length) continue;
+      const owner = getOwner({ post });
+      const userHandle = owner.handle || null;
+      const userId = owner.id || null;
+      const userKey = userHandle
+        ? `h:${userHandle.toLowerCase()}`
+        : (userId ? `id:${String(userId)}` : null);
+      const payload = {
+        postId: post.id,
+        ts: Date.now(),
+        userHandle,
+        userId,
+        userKey
+      };
+      if (eventType === 'like') payload.mailbox_likes = actorEvents;
+      if (eventType === 'comment') payload.mailbox_comments = actorEvents;
+      batch.push(payload);
+    }
+    if (feedItems.length) {
+      dlog('feed', 'processMailboxJson posts', { items: feedItems.length });
+      processFeedJson({ items: feedItems });
+    }
     if (batch.length) {
       try {
         window.postMessage({ __sora_uv__: true, type: 'metrics_batch', items: batch }, '*');
