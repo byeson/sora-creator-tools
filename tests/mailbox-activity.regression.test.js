@@ -110,14 +110,24 @@ function buildDashboardHarness() {
   vm.createContext(context);
   vm.runInContext(
     `
+      const TOP_TODAY_KEY = '__top_today__';
+      const CAMEO_KEY_PREFIX = 'c:';
       const SITE_ORIGIN = 'https://sora.chatgpt.com';
       ${snippet}
       globalThis.__computeMailboxActivityInsights = computeMailboxActivityInsights;
+      globalThis.__shouldShowMailboxActivityForSelection = shouldShowMailboxActivityForSelection;
+      globalThis.__setMailboxOwnerKey = (value) => { mailboxOwnerKey = value; };
+      globalThis.__setMetrics = (value) => { metrics = value; };
     `,
     context,
     { filename: 'dashboard-mailbox-harness.js' }
   );
-  return { computeMailboxActivityInsights: context.__computeMailboxActivityInsights };
+  return {
+    computeMailboxActivityInsights: context.__computeMailboxActivityInsights,
+    shouldShowMailboxActivityForSelection: context.__shouldShowMailboxActivityForSelection,
+    setMailboxOwnerKey: context.__setMailboxOwnerKey,
+    setMetrics: context.__setMetrics,
+  };
 }
 
 test('content sanitizeMetricsItem keeps mailbox actor events', () => {
@@ -169,6 +179,7 @@ test('inject processMailboxJson forwards embedded post payloads and actor batche
           post: {
             id: 's_parent',
             shared_by: 'user-1',
+            is_owner: true,
             remix_posts: {
               items: [
                 { post: { id: 's_child', shared_by: 'user-2', parent_post_id: 's_parent' } }
@@ -186,11 +197,13 @@ test('inject processMailboxJson forwards embedded post payloads and actor batche
   assert.equal(feedPayloads.length, 1);
   assert.equal(feedPayloads[0].items.length, 1);
   assert.equal(feedPayloads[0].items[0].post.id, 's_parent');
-  assert.equal(messages.length, 1);
+  assert.equal(messages.length, 2);
   assert.equal(messages[0].type, 'metrics_batch');
   assert.equal(messages[0].items.length, 1);
   assert.equal(messages[0].items[0].postId, 's_parent');
   assert.equal(messages[0].items[0].mailbox_likes.length, 2);
+  assert.equal(messages[1].type, 'mailbox_owner');
+  assert.equal(messages[1].userKey, 'id:user-1');
 });
 
 test('dashboard computeMailboxActivityInsights aggregates visible mailbox actors only', () => {
@@ -233,4 +246,24 @@ test('dashboard computeMailboxActivityInsights aggregates visible mailbox actors
     count: 1,
     lastTs: 2000000
   });
+});
+
+test('dashboard mailbox activity visibility is limited to the inferred mailbox owner', () => {
+  const { shouldShowMailboxActivityForSelection, setMailboxOwnerKey, setMetrics } = buildDashboardHarness();
+  setMetrics({
+    users: {
+      'h:byeson': { handle: 'byeson', id: 'user-byeson', posts: {} },
+      'id:user-byeson': { handle: 'byeson', id: 'user-byeson', posts: {} },
+      'h:cameoeds': { handle: 'cameoeds', id: 'user-cameoeds', posts: {} }
+    }
+  });
+  setMailboxOwnerKey('h:byeson');
+  assert.equal(
+    shouldShowMailboxActivityForSelection('id:user-byeson', { handle: 'byeson', id: 'user-byeson', posts: {} }),
+    true
+  );
+  assert.equal(
+    shouldShowMailboxActivityForSelection('h:cameoeds', { handle: 'cameoeds', id: 'user-cameoeds', posts: {} }),
+    false
+  );
 });

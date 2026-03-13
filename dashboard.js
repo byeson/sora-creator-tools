@@ -20,6 +20,7 @@
   const DEFAULT_THUMB_URL = 'icons/logo.webp';
   const EXPIRED_THUMB_URLS_STORAGE_KEY = 'SCT_EXPIRED_THUMB_URLS_V1';
   const USABLE_THUMB_URLS_STORAGE_KEY = 'SCT_USABLE_THUMB_URLS_V1';
+  const MAILBOX_OWNER_KEY_STORAGE_KEY = 'mailboxOwnerKey';
   const MAX_EXPIRED_THUMB_URLS = 2000;
   const MAX_USABLE_THUMB_URLS = 4000;
   const NETWORK_GRAPH_DEFAULT_MAX_NODES = 1200;
@@ -393,6 +394,7 @@
   let snapshotsHydrationPromise = null;
   let lastSessionCacheAt = 0;
   let currentUserKey = null;
+  let mailboxOwnerKey = null;
   let lastSelectedUserKey = null;
   let nextAutoRefreshAt = 0;
   let autoRefreshCountdownTimer = null;
@@ -3196,13 +3198,71 @@
     return user?.handle || userKey;
   }
 
+  function sanitizeFollowersSeries(arr){
+    if (!Array.isArray(arr) || arr.length === 0) return [];
+    const normalizedEntries = [];
+    for (let index = 0; index < arr.length; index++) {
+      const entry = arr[index];
+      if (!entry || typeof entry !== 'object') continue;
+      const t = Number(entry.t);
+      const count = Number(entry.count);
+      if (!Number.isFinite(t) || !Number.isFinite(count)) continue;
+      normalizedEntries.push({
+        ...entry,
+        t,
+        count,
+        __sourceIndex: index
+      });
+    }
+    if (!normalizedEntries.length) return [];
+    normalizedEntries.sort((a, b) => {
+      if (a.t !== b.t) return a.t - b.t;
+      return a.__sourceIndex - b.__sourceIndex;
+    });
+    const deduped = [];
+    for (const normalized of normalizedEntries) {
+      const last = deduped[deduped.length - 1];
+      if (last && Number(last.t) === Number(normalized.t)) {
+        const lastCount = Number(last.count);
+        const nextCount = Number(normalized.count);
+        if (Number.isFinite(nextCount) && (!Number.isFinite(lastCount) || nextCount >= lastCount)) {
+          deduped[deduped.length - 1] = normalized;
+        }
+        continue;
+      }
+      deduped.push(normalized);
+    }
+    const series = deduped.map(({ __sourceIndex, ...entry }) => entry);
+    while (series.length > 1) {
+      const lastCount = Number(series[series.length - 1]?.count);
+      if (lastCount !== 0) break;
+      const hasEarlierPositive = series.slice(0, -1).some((entry) => Number(entry?.count) > 0);
+      if (!hasEarlierPositive) break;
+      series.pop();
+    }
+    return series;
+  }
+
+  function normalizeFollowersChartPoints(points){
+    if (!Array.isArray(points) || points.length === 0) return [];
+    const series = sanitizeFollowersSeries(points.map((point) => ({
+      t: Number(point?.t ?? point?.x),
+      count: Number(point?.count ?? point?.y)
+    })));
+    return series.map((entry) => ({
+      x: entry.t,
+      y: entry.count,
+      t: entry.t
+    }));
+  }
+
   function getFollowersSeriesForUser(userKey, user){
     let arr = Array.isArray(user?.followers) ? user.followers : [];
     if ((!arr || !arr.length) && isCameoKey(userKey)) {
       const fallbackUser = findUserByHandle(metrics, user?.handle || cameoNameFromKey(userKey));
       arr = Array.isArray(fallbackUser?.followers) ? fallbackUser.followers : arr;
     }
-    return arr;
+    return sanitizeFollowersSeries(arr);
   }
 
   function formatUserSelectionLabel(userKey, user){
@@ -3294,6 +3354,12 @@
     if (actorKey.startsWith('h:')) return `@${actorKey.slice(2)}`;
     if (actorKey.startsWith('id:')) return actorKey;
     return actorKey || 'Unknown';
+  }
+
+  function shouldShowMailboxActivityForSelection(userKey, user){
+    if (!userKey || !user || !mailboxOwnerKey) return false;
+    if (isVirtualUserKey(userKey)) return false;
+    return areEquivalentUserKeys(metrics, userKey, mailboxOwnerKey);
   }
 
   function computeMailboxActivityInsights(user, visibleSet){
@@ -3810,7 +3876,7 @@
         if (followersEl) {
           let totalFollowers = 0;
           for (const key of activeUsers) {
-            const arr = Array.isArray(metrics.users?.[key]?.followers) ? metrics.users[key].followers : [];
+            const arr = getFollowersSeriesForUser(key, metrics.users?.[key]);
             const last = arr.length > 0 ? arr[arr.length - 1] : null;
             totalFollowers += num(last?.count);
           }
@@ -3842,7 +3908,7 @@
         cameosEl.textContent = lastCameo ? fmtK2OrInt(lastCameo.count) : '0';
       }
       if (followersEl) {
-        const followersArr = Array.isArray(user.followers) ? user.followers : [];
+        const followersArr = getFollowersSeriesForUser(currentUserKey, user);
         const lastFollower = followersArr.length > 0 ? followersArr[followersArr.length - 1] : null;
         followersEl.textContent = lastFollower ? fmtK2OrInt(lastFollower.count) : '0';
       }
@@ -4595,7 +4661,7 @@
         res.cameos += num(lastCameo?.count);
       }
       // Get latest followers count
-      const followersArr = Array.isArray(user.followers) ? user.followers : [];
+      const followersArr = getFollowersSeriesForUser(user.handle ? `h:${String(user.handle).toLowerCase()}` : '', user);
       if (followersArr.length > 0){
         const lastFollower = followersArr[followersArr.length - 1];
         res.followers += num(lastFollower?.count);
@@ -6139,7 +6205,19 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         mouseX
       };
     }
-    function setData(series){ state.series = series.map(s=>({...s, points: ensureSortedPoints(s.points||[])})); const xs=[], ys=[]; for (const s of state.series){ for (const p of s.points){ xs.push(p.x); ys.push(p.y); } } state.x=extent(xs,d=>d); state.y=extent(ys,d=>d); draw(); }
+    function setData(series){
+      state.series = series.map((s)=>({
+        ...s,
+        points: normalizeFollowersChartPoints(s.points || [])
+      }));
+      const xs=[], ys=[];
+      for (const s of state.series){
+        for (const p of s.points){ xs.push(p.x); ys.push(p.y); }
+      }
+      state.x=extent(xs,d=>d);
+      state.y=extent(ys,d=>d);
+      draw();
+    }
     function mapX(x){ const [a,b]=(state.zoomX||state.x); return M.left + ((x-a)/(b-a||1))*(W-(M.left+M.right)); }
     function mapY(y){ const [a,b]=(state.zoomY||state.y); return H - M.bottom - ((y-a)/(b-a||1))*(H-(M.top+M.bottom)); }
     function clampToPlot(px,py){ const x=Math.max(M.left,Math.min(W-M.right,px)); const y=Math.max(M.top,Math.min(H-M.bottom,py)); return [x,y]; }
@@ -7192,7 +7270,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       for (const [userKey, user] of Object.entries(metrics.users || {})){
         const handle = user.handle || '';
         const userId = user.id || '';
-        const followers = Array.isArray(user.followers) ? user.followers : [];
+        const followers = getFollowersSeriesForUser(userKey, user);
         
         let firstTimestamp = null;
         let prevCount = null;
@@ -7301,7 +7379,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           }
         }
         
-        const followers = Array.isArray(user.followers) ? user.followers : [];
+        const followers = getFollowersSeriesForUser(userKey, user);
         const latestFollowers = followers.length > 0 ? (followers[followers.length - 1]?.count ?? '') : '';
         const latestFollowersTime = followers.length > 0 ? fmtTimestamp(followers[followers.length - 1]?.t) : '';
         const followerHistoryPoints = followers.length;
@@ -7851,7 +7929,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         STACKED_WINDOW_STORAGE_KEYS.viewsPerMinute,
         LEGACY_CHART_MODE_KEYS.interaction,
         LEGACY_CHART_MODE_KEYS.views,
-        LEGACY_CHART_MODE_KEYS.viewsPerPerson
+        LEGACY_CHART_MODE_KEYS.viewsPerPerson,
+        MAILBOX_OWNER_KEY_STORAGE_KEY
       ])
       .catch(() => ({}));
     syncUserSelectionUI();
@@ -10928,7 +11007,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           try {
             const followersEl = $('#followersTotal');
             if (followersEl) {
-              const followersArr = Array.isArray(user.followers) ? user.followers : [];
+              const followersArr = getFollowersSeriesForUser(currentUserKey, user);
               const lastFollower = followersArr.length > 0 ? followersArr[followersArr.length - 1] : null;
               followersEl.textContent = lastFollower ? fmtK2OrInt(lastFollower.count) : '0';
             }
@@ -11433,10 +11512,16 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     }
 
     function renderMailboxActivityPanel(user, visibleIds){
+      const blockEl = $('.mailbox-activity-block');
       const statsEl = $('#mailboxActivityStats');
       const likersBodyEl = $('#topMailboxLikersBody');
       const commentersBodyEl = $('#topMailboxCommentersBody');
-      if (!statsEl || !likersBodyEl || !commentersBodyEl) return;
+      const shouldShow = shouldShowMailboxActivityForSelection(currentUserKey, user);
+      if (blockEl) {
+        blockEl.classList.toggle('is-hidden', !shouldShow);
+        blockEl.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+      }
+      if (!shouldShow || !statsEl || !likersBodyEl || !commentersBodyEl) return;
       if (!user || !user.posts) {
         statsEl.textContent = 'No mailbox activity';
         likersBodyEl.innerHTML = '<tr><td colspan="3">Select a profile to view likers.</td></tr>';
@@ -12952,7 +13037,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (!user.posts) user.posts = {};
 
         // Get follower count for later use
-        const followersArr = Array.isArray(user.followers) ? user.followers : [];
+        const followersArr = getFollowersSeriesForUser(userKey, user);
         const latestFollowers = followersArr.length > 0 ? Number(followersArr[followersArr.length - 1]?.count) : 0;
         const prePurgePostCount = Object.keys(user.posts || {}).length;
         const hasLowFollowers = minFollowers > 0 && (!isFinite(latestFollowers) || latestFollowers < minFollowers);
@@ -14029,6 +14114,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           });
         }
       }
+      mailboxOwnerKey = typeof st?.[MAILBOX_OWNER_KEY_STORAGE_KEY] === 'string' && st[MAILBOX_OWNER_KEY_STORAGE_KEY]
+        ? st[MAILBOX_OWNER_KEY_STORAGE_KEY]
+        : null;
       zoomStates = st.zoomStates || {};
       zoomStatesLoaded = true;
       applyDefaultInteractionRateZoom(currentUserKey);

@@ -394,6 +394,19 @@
     } catch {}
   });
 
+  window.addEventListener('message', function(ev) {
+    if (ev?.source !== window) return;
+    const d = ev?.data;
+    if (!d || d.__sora_uv__ !== true || d.type !== 'mailbox_owner') return;
+    const userHandle = sanitizeString(d.userHandle, MAX_HANDLE_LEN);
+    const providedUserKey = sanitizeIdToken(d.userKey);
+    const userKey = providedUserKey || (userHandle ? `h:${userHandle.toLowerCase()}` : null);
+    if (!userKey) return;
+    try {
+      chrome.runtime.sendMessage({ action: 'mailbox_owner', userKey, userHandle });
+    } catch {}
+  });
+
   // Relay metrics requests from inject.js to background and return the response.
   window.addEventListener('message', function(ev) {
     if (ev?.source !== window) return;

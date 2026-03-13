@@ -10,6 +10,7 @@ let flushTimer = null;
 const METRICS_STORAGE_KEY = 'metrics';
 const METRICS_UPDATED_AT_KEY = 'metricsUpdatedAt';
 const METRICS_USERS_INDEX_KEY = 'metricsUsersIndex';
+const MAILBOX_OWNER_KEY_STORAGE_KEY = 'mailboxOwnerKey';
 const TRUSTED_TAB_URL_RE = /^https:\/\/sora\.chatgpt\.com\//i;
 const MAX_MESSAGE_BATCH_ITEMS = 250;
 const MAX_SNAPSHOT_HISTORY_PER_POST = 720;
@@ -337,6 +338,15 @@ function resolveIncomingUserKey(metrics, snap) {
   }
 
   return snap?.userKey || snap?.pageUserKey || 'unknown';
+}
+
+function shouldPersistFollowerCount(series, nextCount) {
+  if (!Number.isFinite(nextCount)) return false;
+  const arr = Array.isArray(series) ? series : [];
+  const lastCount = Number(arr[arr.length - 1]?.count);
+  // Treat a zero after a known positive history as a transient bad snapshot.
+  if (nextCount === 0 && Number.isFinite(lastCount) && lastCount > 0) return false;
+  return true;
 }
 
 function normalizeMetrics(raw) {
@@ -849,8 +859,8 @@ async function flush() {
         // Capture follower history at the user level when available
         if (snap.followers != null) {
           const fCount = Number(snap.followers);
-          if (Number.isFinite(fCount)) {
-            const arr = userEntry.followers;
+          const arr = userEntry.followers;
+          if (shouldPersistFollowerCount(arr, fCount)) {
             const t = snap.ts || Date.now();
             const lastF = arr[arr.length - 1];
             if (!lastF || lastF.count !== fCount) {
@@ -859,6 +869,8 @@ async function flush() {
               dirty = true;
               if (DEBUG.storage) dlog('storage', 'followers persisted', { userKey, count: fCount, t });
             }
+          } else if (DEBUG.storage) {
+            dlog('storage', 'followers skipped (suspicious)', { userKey, count: fCount });
           }
         }
         // Capture cameo count (profile-level) if available
@@ -1042,6 +1054,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       scheduleFlush();
     }
     return false; // fire-and-forget
+  }
+
+  if (message.action === 'mailbox_owner') {
+    const userKey = sanitizeIdToken(message.userKey);
+    if (userKey) {
+      chrome.storage.local.set({ [MAILBOX_OWNER_KEY_STORAGE_KEY]: userKey });
+    }
+    return false;
   }
 
   if (message.action === 'metrics_request') {

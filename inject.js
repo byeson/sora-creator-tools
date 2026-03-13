@@ -5793,10 +5793,20 @@ async function renderAnalyzeTable(force = false) {
     if (!items.length) return;
     const feedItems = [];
     const batch = [];
+    let mailboxOwner = null;
     for (const item of items) {
       const post = item?.object?.kind === 'post' ? item.object?.post : null;
       if (!post || typeof post !== 'object' || !post.id) continue;
       feedItems.push({ post });
+      if (!mailboxOwner && post.is_owner === true) {
+        const owner = getOwner({ post });
+        const userHandle = owner.handle || null;
+        const userId = owner.id || null;
+        const userKey = userHandle
+          ? `h:${userHandle.toLowerCase()}`
+          : (userId ? `id:${String(userId)}` : null);
+        if (userKey) mailboxOwner = { userKey, userHandle, userId };
+      }
       const eventType = classifyMailboxEventType(item);
       if (eventType !== 'like' && eventType !== 'comment') continue;
       const actorEvents = extractMailboxActorEvents(item);
@@ -5825,6 +5835,11 @@ async function renderAnalyzeTable(force = false) {
     if (batch.length) {
       try {
         window.postMessage({ __sora_uv__: true, type: 'metrics_batch', items: batch }, '*');
+      } catch {}
+    }
+    if (mailboxOwner?.userKey) {
+      try {
+        window.postMessage({ __sora_uv__: true, type: 'mailbox_owner', ...mailboxOwner }, '*');
       } catch {}
     }
   }
