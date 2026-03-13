@@ -1113,6 +1113,14 @@ body.is-resizing{cursor:col-resize;user-select:none}
 .remix-remixers-table td{
   color:rgba(236,243,248,0.92);
 }
+.remix-remixers-user-link{
+  color:inherit;
+  text-decoration:none;
+}
+.remix-remixers-user-link:hover,
+.remix-remixers-user-link:focus-visible{
+  text-decoration:underline;
+}
 .remix-remixers-table td:last-child,
 .remix-remixers-table th:last-child{
   text-align:right;

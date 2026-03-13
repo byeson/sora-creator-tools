@@ -11307,7 +11307,17 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         bodyEl.innerHTML = '<tr><td colspan="3">No remixers found for the current post filter.</td></tr>';
         return;
       }
-      bodyEl.innerHTML = topRemixers.slice(0, 20).map((row, idx)=>`<tr><td>${idx + 1}</td><td>${esc(formatNetworkOwnerLabel(row.ownerKey))}</td><td>${fmt(row.count)}</td></tr>`).join('');
+      bodyEl.innerHTML = topRemixers.slice(0, 20).map((row, idx)=>{
+        const ownerKey = normalizeCameoName(row.ownerKey || '');
+        const ownerLabel = esc(formatNetworkOwnerLabel(ownerKey));
+        const profileUrl = ownerKey && ownerKey !== '__unknown__'
+          ? `${SITE_ORIGIN}/profile/${encodeURIComponent(ownerKey)}`
+          : '';
+        const ownerCell = profileUrl
+          ? `<a class="remix-remixers-user-link" href="${esc(profileUrl)}" target="_blank" rel="noopener">${ownerLabel}</a>`
+          : ownerLabel;
+        return `<tr><td>${idx + 1}</td><td>${ownerCell}</td><td>${fmt(row.count)}</td></tr>`;
+      }).join('');
     }
 
     function refreshNetworkOwnerFilterOptions(baseGraph, user){
