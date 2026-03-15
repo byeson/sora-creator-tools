@@ -3558,10 +3558,29 @@ function badgeEmojiFor(id, meta) {
     return candidates[0]?.btn || null;
   }
 
+  function clearActivityDockSlot(bar, keepNode = null) {
+    const dockSlot = bar?._activityDockSlot;
+    if (!dockSlot) return;
+    const children = Array.from(dockSlot.children || []);
+    for (const child of children) {
+      if (keepNode && child === keepNode) continue;
+      try {
+        if (typeof child.remove === 'function') child.remove();
+        else if (child.parentNode === dockSlot && typeof dockSlot.removeChild === 'function') dockSlot.removeChild(child);
+      } catch {}
+    }
+  }
+
   function undockActivityButton(bar) {
     if (!bar) return;
     const state = bar._activityDockState;
-    if (!state) return;
+    if (!state) {
+      clearActivityDockSlot(bar);
+      if (bar._activityDockSlot) {
+        bar._activityDockSlot.style.display = 'none';
+      }
+      return;
+    }
     const node = state.node;
     const parent = state.originalParent;
     const nextSibling = state.originalNextSibling;
@@ -3570,11 +3589,16 @@ function badgeEmojiFor(id, meta) {
     if (node && parent && parent.isConnected) {
       if (nextSibling && nextSibling.parentNode === parent) parent.insertBefore(node, nextSibling);
       else parent.appendChild(node);
+    } else if (node && bar._activityDockSlot && bar._activityDockSlot.contains(node)) {
+      try {
+        if (typeof node.remove === 'function') node.remove();
+      } catch {}
     }
     if (state.nativeContainer && state.nativeContainer.isConnected) {
       state.nativeContainer.style.display = state.nativeDisplay || '';
     }
     if (bar._activityDockSlot) {
+      clearActivityDockSlot(bar);
       bar._activityDockSlot.style.display = 'none';
     }
     bar._activityDockState = null;
@@ -3584,6 +3608,7 @@ function badgeEmojiFor(id, meta) {
     if (!bar || !bar._buttonRow) return;
     const existingState = bar._activityDockState;
     if (existingState?.node && bar._activityDockSlot && bar._activityDockSlot.contains(existingState.node)) {
+      clearActivityDockSlot(bar, existingState.node);
       bar._activityDockSlot.style.display = 'flex';
       return;
     }
@@ -3613,6 +3638,7 @@ function badgeEmojiFor(id, meta) {
     const nodeMarginLeft = moveNode.style.marginLeft;
     const nodeMarginRight = moveNode.style.marginRight;
     undockActivityButton(bar);
+    clearActivityDockSlot(bar);
     bar._activityDockState = {
       node: moveNode,
       originalParent: moveNode.parentNode,
