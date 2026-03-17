@@ -353,6 +353,7 @@
   const BEST_TIME_PREFS_KEY = 'SCT_DASHBOARD_BEST_TIME_PREFS_V1';
   const VIEWS_TYPE_STORAGE_KEY = 'SCT_DASHBOARD_VIEWS_TYPE_V1';
   const CHART_MODE_STORAGE_KEY = 'SCT_DASHBOARD_CHART_MODE_V1';
+  const DISCOVERY_KEYWORD_VIZ_STORAGE_KEY = 'SCT_DASHBOARD_DISCOVERY_KEYWORD_VIZ_V1';
   const STACKED_WINDOW_STORAGE_KEYS = {
     interaction: 'SCT_DASHBOARD_STACKED_WINDOW_INTERACTION_V1',
     views: 'SCT_DASHBOARD_STACKED_WINDOW_VIEWS_V1',
@@ -1068,6 +1069,21 @@
     if (!normalized) return;
     try { localStorage.setItem(key, normalized); } catch {}
     try { chrome.storage.local.set({ [key]: normalized }); } catch {}
+  }
+
+  function normalizeDiscoveryKeywordVizMode(raw){
+    return raw === 'chart' || raw === 'cloud' ? raw : null;
+  }
+
+  function loadDiscoveryKeywordVizMode(){
+    try { return normalizeDiscoveryKeywordVizMode(localStorage.getItem(DISCOVERY_KEYWORD_VIZ_STORAGE_KEY)); } catch { return null; }
+  }
+
+  function saveDiscoveryKeywordVizMode(mode){
+    const normalized = normalizeDiscoveryKeywordVizMode(mode);
+    if (!normalized) return;
+    try { localStorage.setItem(DISCOVERY_KEYWORD_VIZ_STORAGE_KEY, normalized); } catch {}
+    try { chrome.storage.local.set({ [DISCOVERY_KEYWORD_VIZ_STORAGE_KEY]: normalized }); } catch {}
   }
 
   function resolveLegacyChartMode(legacyModes){
@@ -3213,6 +3229,63 @@
   function buildDiscoveryPhraseLine(post) {
     const phrase = normalizeDiscoveryPhrase(post?.discoveryPhrase ?? post?.discovery_phrase);
     return phrase || '';
+  }
+
+  function extractDiscoveryPhraseKeywords(value) {
+    const phrase = normalizeDiscoveryPhrase(value);
+    if (!phrase) return [];
+    const tokens = phrase.toLowerCase().match(/[a-z0-9]+(?:[._'-][a-z0-9]+)*/g) || [];
+    const unique = [];
+    const seen = new Set();
+    for (const token of tokens) {
+      if (!token || seen.has(token)) continue;
+      seen.add(token);
+      unique.push(token);
+    }
+    return unique;
+  }
+
+  function computeDiscoveryKeywordStats(user, visibleSet, limit = 12) {
+    const postEntries = user?.posts && typeof user.posts === 'object'
+      ? Object.entries(user.posts)
+      : [];
+    const safeLimit = Math.max(1, Number(limit) || 12);
+    const counts = new Map();
+    const stats = {
+      totalPosts: 0,
+      postsWithPhrase: 0,
+      postsWithoutPhrase: 0,
+      uniqueKeywordCount: 0,
+      items: []
+    };
+    if (!postEntries.length) return stats;
+    for (const [pid, post] of postEntries) {
+      if (visibleSet instanceof Set && !visibleSet.has(pid)) continue;
+      stats.totalPosts++;
+      const keywords = extractDiscoveryPhraseKeywords(post?.discovery_phrase ?? post?.discoveryPhrase);
+      if (!keywords.length) {
+        stats.postsWithoutPhrase++;
+        continue;
+      }
+      stats.postsWithPhrase++;
+      for (const keyword of keywords) {
+        counts.set(keyword, (counts.get(keyword) || 0) + 1);
+      }
+    }
+    stats.uniqueKeywordCount = counts.size;
+    stats.items = Array.from(counts.entries())
+      .map(([keyword, count]) => ({
+        keyword,
+        count,
+        isMissing: keyword === 'N/A'
+      }))
+      .sort((a, b) => {
+        if (b.count !== a.count) return b.count - a.count;
+        if (a.isMissing !== b.isMissing) return a.isMissing ? 1 : -1;
+        return a.keyword.localeCompare(b.keyword);
+      })
+      .slice(0, safeLimit);
+    return stats;
   }
 
   function truncateForPurgeCaption(text){
@@ -7321,6 +7394,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         VIEWS_TYPE_STORAGE_KEY,
         BEST_TIME_PREFS_KEY,
         CHART_MODE_STORAGE_KEY,
+        DISCOVERY_KEYWORD_VIZ_STORAGE_KEY,
         STACKED_WINDOW_STORAGE_MIN_KEYS.interaction,
         STACKED_WINDOW_STORAGE_MIN_KEYS.views,
         STACKED_WINDOW_STORAGE_MIN_KEYS.viewsPerPerson,
@@ -7339,6 +7413,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     syncUserSelectionUI();
     const initialViewsChartType = loadViewsChartType();
     const initialChartsMode = loadChartMode(CHART_MODE_STORAGE_KEY);
+    const initialDiscoveryKeywordVizMode = loadDiscoveryKeywordVizMode();
     const legacyChartModes = {
       interaction: loadChartMode(LEGACY_CHART_MODE_KEYS.interaction),
       views: loadChartMode(LEGACY_CHART_MODE_KEYS.views),
@@ -7351,6 +7426,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const shouldPersistLegacyChartMode = !initialChartsMode && !!legacyChartsMode;
     let chartsMode = initialChartsMode || legacyChartsMode || 'linear';
     let chartModeLoaded = !!initialChartsMode || !!legacyChartsMode;
+    let discoveryKeywordVizMode = initialDiscoveryKeywordVizMode || 'chart';
+    let discoveryKeywordVizModeLoaded = !!initialDiscoveryKeywordVizMode;
+    let lastDiscoveryKeywordStats = null;
     let chart = makeChart($('#chart'), viewsAxisLabel, viewsAxisLabel);
     let interactionRateStackedChart = makeFirst24HoursChart(
       $('#interactionRateStackedChart'),
@@ -7370,6 +7448,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     let allViewsChart = makeTimeChart($('#allViewsChart'), '#allViewsTooltip', 'Total Views', fmt2);
     const allLikesChart = makeTimeChart($('#allLikesChart'), '#allLikesTooltip', 'Likes', fmt2);
     const cameosChart = makeTimeChart($('#cameosChart'), '#cameosTooltip', 'Cast in', fmt2);
+    const discoveryKeywordsSubtitle = $('#discoveryKeywordsSubtitle');
+    const discoveryKeywordsEmpty = $('#discoveryKeywordsEmpty');
+    const discoveryKeywordsBars = $('#discoveryKeywordsBars');
+    const discoveryKeywordsCloud = $('#discoveryKeywordsCloud');
     const PRESET_VISIBILITY_ACTIONS = new Set([
       'pastDay',
       'pastWeek',
@@ -9841,6 +9923,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       likesPerMinuteTimeChart.setData([]);
       viewsPerMinuteChart.setData([]);
       viewsPerMinuteTimeChart.setData([]);
+      renderDiscoveryPhraseKeywords(null, null);
       return;
     }
         // No precompute needed for IR; use latest available remix count only for cards
@@ -10152,6 +10235,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
               updateFirst24HoursChart(range.min, range.max);
             }
             refreshPerMinuteCharts(user, visibleSet);
+            renderDiscoveryPhraseKeywords(user, visibleSet);
             // Only update compare charts if no compare users are selected
             if (compareUsers.size === 0){
               // Update unfiltered totals cards for single user
@@ -10390,6 +10474,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             updateFirst24HoursChart(range.min, range.max);
           }
           refreshPerMinuteCharts(user, visibleSet);
+          renderDiscoveryPhraseKeywords(user, visibleSet);
           // (likes total chart is unfiltered; no need to refresh here)
           updateSummaryMetrics(user, visibleSet);
           try {
@@ -10756,6 +10841,111 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (!btn) return;
       btn.classList.toggle('active', isActive);
       btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    }
+
+    function formatDiscoveryKeywordCount(count){
+      const value = Math.max(0, Number(count) || 0);
+      return `${value} ${value === 1 ? 'post' : 'posts'}`;
+    }
+
+    function syncDiscoveryKeywordVizPills(mode = discoveryKeywordVizMode){
+      setToggleState($('#discoveryKeywordsChartPill'), mode !== 'cloud');
+      setToggleState($('#discoveryKeywordsCloudPill'), mode === 'cloud');
+    }
+
+    function renderDiscoveryKeywordViz(stats){
+      lastDiscoveryKeywordStats = stats;
+      if (!discoveryKeywordsBars || !discoveryKeywordsCloud || !discoveryKeywordsEmpty || !discoveryKeywordsSubtitle) return;
+      const totalPosts = Number(stats?.totalPosts) || 0;
+      if (!stats || totalPosts <= 0) {
+        discoveryKeywordsSubtitle.textContent = 'Raw count of visible posts mentioning each discovery phrase keyword.';
+        discoveryKeywordsEmpty.textContent = 'No visible posts selected yet.';
+        discoveryKeywordsEmpty.classList.remove('is-hidden');
+        discoveryKeywordsBars.classList.add('is-hidden');
+        discoveryKeywordsCloud.classList.add('is-hidden');
+        discoveryKeywordsBars.replaceChildren();
+        discoveryKeywordsCloud.replaceChildren();
+        return;
+      }
+      discoveryKeywordsSubtitle.textContent = 'Raw count of visible posts mentioning each discovery phrase keyword.';
+      const items = Array.isArray(stats.items) ? stats.items : [];
+      if (!items.length) {
+        discoveryKeywordsEmpty.textContent = 'No discovery phrase keywords available for the current selection.';
+        discoveryKeywordsEmpty.classList.remove('is-hidden');
+        discoveryKeywordsBars.classList.add('is-hidden');
+        discoveryKeywordsCloud.classList.add('is-hidden');
+        discoveryKeywordsBars.replaceChildren();
+        discoveryKeywordsCloud.replaceChildren();
+        return;
+      }
+      discoveryKeywordsEmpty.classList.add('is-hidden');
+      discoveryKeywordsBars.replaceChildren();
+      discoveryKeywordsCloud.replaceChildren();
+      const maxCount = items.reduce((max, item)=>Math.max(max, Number(item?.count) || 0), 0) || 1;
+      const minCount = items.reduce((min, item)=>Math.min(min, Number(item?.count) || 0), maxCount);
+      items.forEach((item, index)=>{
+        const color = COLORS[index % COLORS.length];
+        const count = Math.max(0, Number(item?.count) || 0);
+        const pct = clamp((count / maxCount) * 100, 0, 100);
+        const metricText = formatDiscoveryKeywordCount(count);
+
+        const row = document.createElement('div');
+        row.className = 'discovery-keywords-row';
+        const rowHead = document.createElement('div');
+        rowHead.className = 'discovery-keywords-row-head';
+        const label = document.createElement('span');
+        label.className = 'discovery-keywords-word';
+        if (item.isMissing) label.classList.add('is-na');
+        label.textContent = item.keyword;
+        const metric = document.createElement('span');
+        metric.className = 'discovery-keywords-metric';
+        metric.textContent = metricText;
+        rowHead.appendChild(label);
+        rowHead.appendChild(metric);
+        const bar = document.createElement('div');
+        bar.className = 'discovery-keywords-bar';
+        const fill = document.createElement('div');
+        fill.className = 'discovery-keywords-fill';
+        fill.style.width = `${pct}%`;
+        fill.style.setProperty('--keyword-color', color);
+        bar.appendChild(fill);
+        row.appendChild(rowHead);
+        row.appendChild(bar);
+        discoveryKeywordsBars.appendChild(row);
+
+        const chip = document.createElement('div');
+        chip.className = 'discovery-keywords-cloud-item';
+        if (item.isMissing) chip.classList.add('is-na');
+        chip.style.setProperty('--keyword-color', color);
+        const normalizedCount = maxCount === minCount ? 1 : (count - minCount) / (maxCount - minCount);
+        chip.style.fontSize = `${Math.round((14 + normalizedCount * 16) * 10) / 10}px`;
+        chip.title = `${item.keyword}: ${metricText}`;
+        const chipLabel = document.createElement('span');
+        chipLabel.textContent = item.keyword;
+        const chipRate = document.createElement('span');
+        chipRate.className = 'discovery-keywords-cloud-rate';
+        chipRate.textContent = metricText;
+        chip.appendChild(chipLabel);
+        chip.appendChild(chipRate);
+        discoveryKeywordsCloud.appendChild(chip);
+      });
+      discoveryKeywordsBars.classList.toggle('is-hidden', discoveryKeywordVizMode === 'cloud');
+      discoveryKeywordsCloud.classList.toggle('is-hidden', discoveryKeywordVizMode !== 'cloud');
+    }
+
+    function renderDiscoveryPhraseKeywords(user, visibleSet){
+      const stats = computeDiscoveryKeywordStats(user, visibleSet, 12);
+      renderDiscoveryKeywordViz(stats);
+    }
+
+    function setDiscoveryKeywordVizMode(mode, opts = {}){
+      const normalized = normalizeDiscoveryKeywordVizMode(mode);
+      if (!normalized) return;
+      discoveryKeywordVizMode = normalized;
+      if (opts.persist !== false) saveDiscoveryKeywordVizMode(normalized);
+      discoveryKeywordVizModeLoaded = true;
+      syncDiscoveryKeywordVizPills(normalized);
+      renderDiscoveryKeywordViz(lastDiscoveryKeywordStats);
     }
 
     function setCanvasVisible(canvas, isVisible){
@@ -11143,11 +11333,17 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const chartModeStackedBtn = $('#chartModeStacked');
     if (chartModeLinearBtn) chartModeLinearBtn.addEventListener('click', ()=> setGlobalChartMode('linear'));
     if (chartModeStackedBtn) chartModeStackedBtn.addEventListener('click', ()=> setGlobalChartMode('stacked'));
+    const discoveryKeywordsChartBtn = $('#discoveryKeywordsChartPill');
+    const discoveryKeywordsCloudBtn = $('#discoveryKeywordsCloudPill');
+    if (discoveryKeywordsChartBtn) discoveryKeywordsChartBtn.addEventListener('click', ()=> setDiscoveryKeywordVizMode('chart'));
+    if (discoveryKeywordsCloudBtn) discoveryKeywordsCloudBtn.addEventListener('click', ()=> setDiscoveryKeywordVizMode('cloud'));
     applyStackedWindowDefaults();
     setGlobalChartMode(chartsMode, { persist: shouldPersistLegacyChartMode });
     syncViewsHeaders(viewsChartType);
     syncViewsPills(viewsChartType);
     syncYAxisLabels(viewsChartType);
+    syncDiscoveryKeywordVizPills(discoveryKeywordVizMode);
+    renderDiscoveryKeywordViz(null);
 
 
     // Typeahead suggestions
@@ -11502,6 +11698,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         SIDEBAR_WIDTH_KEY,
         VIEWS_TYPE_STORAGE_KEY,
         CHART_MODE_STORAGE_KEY,
+        DISCOVERY_KEYWORD_VIZ_STORAGE_KEY,
         BEST_TIME_PREFS_KEY,
         'sctLastFilterAction',
         'sctLastFilterActionByUser'
@@ -11517,6 +11714,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         BEST_TIME_PREFS_KEY,
         VIEWS_TYPE_STORAGE_KEY,
         CHART_MODE_STORAGE_KEY,
+        DISCOVERY_KEYWORD_VIZ_STORAGE_KEY,
         'lastFilterAction',
         'lastFilterActionByUser',
         'lastUserKey',
@@ -12999,6 +13197,13 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           }
           chartModeLoaded = true;
         }
+      }
+      const storedDiscoveryKeywordVizMode = normalizeDiscoveryKeywordVizMode(st?.[DISCOVERY_KEYWORD_VIZ_STORAGE_KEY]);
+      if (storedDiscoveryKeywordVizMode) {
+        if (!discoveryKeywordVizModeLoaded && storedDiscoveryKeywordVizMode !== discoveryKeywordVizMode) {
+          setDiscoveryKeywordVizMode(storedDiscoveryKeywordVizMode, { persist: false });
+        }
+        discoveryKeywordVizModeLoaded = true;
       }
       const storedInteractionMin = normalizeStackedWindowStartMinutes(st?.[STACKED_WINDOW_STORAGE_MIN_KEYS.interaction], null);
       const storedInteractionMax = normalizeStackedWindowMinutes(st?.[STACKED_WINDOW_STORAGE_KEYS.interaction], null);

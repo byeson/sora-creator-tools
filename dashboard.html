@@ -230,6 +230,21 @@
           <span class="label">Followers</span>
         </div>
       </div>
+      <div class="chart-block chart-block--discovery-keywords">
+        <div class="chart-header">
+          <h4 id="discoveryKeywordsTitle" class="chart-title">Top Discovery Phrase Keywords</h4>
+          <div class="toggle-group toggle-group--sm" role="group" aria-label="Discovery phrase keyword view">
+            <button id="discoveryKeywordsChartPill" class="toggle-pill active" data-mode="chart" aria-pressed="true">Top Chart</button>
+            <button id="discoveryKeywordsCloudPill" class="toggle-pill" data-mode="cloud" aria-pressed="false">Word Cloud</button>
+          </div>
+        </div>
+        <p id="discoveryKeywordsSubtitle" class="section-note discovery-keywords-subtitle">Raw count of visible posts mentioning each discovery phrase keyword.</p>
+        <div id="discoveryKeywordsPanel" class="discovery-keywords-panel">
+          <div id="discoveryKeywordsEmpty" class="discovery-keywords-empty is-hidden"></div>
+          <div id="discoveryKeywordsBars" class="discovery-keywords-bars"></div>
+          <div id="discoveryKeywordsCloud" class="discovery-keywords-cloud is-hidden"></div>
+        </div>
+      </div>
       <div class="views-toggle">
         <div class="toggle-group toggle-group--lg" role="group" aria-label="View type">
           <button id="totalViewsPill" class="views-pill toggle-pill toggle-pill--lg active" data-type="total" aria-pressed="true">Total Views</button>

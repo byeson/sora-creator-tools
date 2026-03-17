@@ -69,12 +69,16 @@ function buildLineHarness() {
     ${snippet}
     globalThis.__normalizeDiscoveryPhrase = normalizeDiscoveryPhrase;
     globalThis.__buildDiscoveryPhraseLine = buildDiscoveryPhraseLine;
+    globalThis.__extractDiscoveryPhraseKeywords = extractDiscoveryPhraseKeywords;
+    globalThis.__computeDiscoveryKeywordStats = computeDiscoveryKeywordStats;
   `;
   vm.createContext(context);
   vm.runInContext(bootstrap, context, { filename: 'dashboard-discovery-line-harness.js' });
   return {
     normalizeDiscoveryPhrase: context.__normalizeDiscoveryPhrase,
     buildDiscoveryPhraseLine: context.__buildDiscoveryPhraseLine,
+    extractDiscoveryPhraseKeywords: context.__extractDiscoveryPhraseKeywords,
+    computeDiscoveryKeywordStats: context.__computeDiscoveryKeywordStats,
   };
 }
 
@@ -289,6 +293,46 @@ test('buildDiscoveryPhraseLine normalizes whitespace and returns empty for missi
   assert.equal(buildDiscoveryPhraseLine({ discovery_phrase: '  delft   pottery \n organ   pug  ' }), 'delft pottery organ pug');
   assert.equal(buildDiscoveryPhraseLine({ discovery_phrase: '   ' }), '');
   assert.equal(buildDiscoveryPhraseLine({}), '');
+});
+
+test('extractDiscoveryPhraseKeywords lowercases and deduplicates normalized tokens', () => {
+  const { extractDiscoveryPhraseKeywords } = buildLineHarness();
+  const keywords = JSON.parse(JSON.stringify(extractDiscoveryPhraseKeywords('  Neo-noir  organ  organ  3D, glow  ')));
+
+  assert.deepEqual(
+    keywords,
+    ['neo-noir', 'organ', '3d', 'glow']
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(extractDiscoveryPhraseKeywords('   '))), []);
+});
+
+test('computeDiscoveryKeywordStats ignores posts without discovery phrases', () => {
+  const { computeDiscoveryKeywordStats } = buildLineHarness();
+  const user = {
+    posts: {
+      s_1: { discovery_phrase: 'Delft pottery organ pug pug' },
+      s_2: { discovery_phrase: 'organ neon pug' },
+      s_3: { discovery_phrase: '   ' },
+      s_4: {}
+    }
+  };
+
+  const stats = computeDiscoveryKeywordStats(user, new Set(['s_1', 's_2', 's_3', 's_4']), 5);
+  const items = JSON.parse(JSON.stringify(stats.items.map(({ keyword, count }) => [keyword, count])));
+
+  assert.equal(stats.totalPosts, 4);
+  assert.equal(stats.postsWithPhrase, 2);
+  assert.equal(stats.uniqueKeywordCount, 5);
+  assert.deepEqual(
+    items,
+    [
+      ['organ', 2],
+      ['pug', 2],
+      ['delft', 1],
+      ['neon', 1],
+      ['pottery', 1]
+    ]
+  );
 });
 
 test('exportAllDataCSV includes discovery phrase columns and values', async () => {
