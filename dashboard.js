@@ -2041,7 +2041,7 @@
       mergedDuplicateSnapshotTimestamps += mergedSnap.duplicateTimestamps;
       for (let i = 1; i < posts.length; i++) {
         const source = posts[i] || {};
-        const fillFields = ['url', 'thumb', 'caption', 'title', 'label', 'ownerKey', 'ownerId', 'ownerHandle', 'post_time', 'postTime'];
+        const fillFields = ['url', 'thumb', 'caption', 'title', 'label', 'ownerKey', 'ownerId', 'ownerHandle', 'post_time', 'postTime', 'discovery_phrase', 'parent_post_id', 'root_post_id'];
         for (const field of fillFields) {
           if (!merged[field] && source[field]) merged[field] = source[field];
         }
@@ -2049,6 +2049,8 @@
           const left = Array.isArray(merged.cameo_usernames) ? merged.cameo_usernames : [];
           merged.cameo_usernames = Array.from(new Set(left.concat(source.cameo_usernames).filter(Boolean)));
         }
+        const mergedRemixPostIds = mergeRemixPostIds(merged.remix_post_ids, source.remix_post_ids);
+        if (mergedRemixPostIds.length) merged.remix_post_ids = mergedRemixPostIds;
       }
       mergedPosts[pid] = merged;
     }
@@ -3243,6 +3245,286 @@
       unique.push(token);
     }
     return unique;
+  }
+
+  function normalizeRemixPostIds(value) {
+    if (!Array.isArray(value)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const raw of value) {
+      if (typeof raw !== 'string') continue;
+      const remixPostId = raw.trim();
+      if (!remixPostId || seen.has(remixPostId)) continue;
+      seen.add(remixPostId);
+      out.push(remixPostId);
+    }
+    return out;
+  }
+
+  function mergeRemixPostIds(existing, incoming) {
+    const out = normalizeRemixPostIds(existing);
+    const seen = new Set(out);
+    for (const remixPostId of normalizeRemixPostIds(incoming)) {
+      if (seen.has(remixPostId)) continue;
+      seen.add(remixPostId);
+      out.push(remixPostId);
+    }
+    return out;
+  }
+
+  function buildParentRemixPostIndex(metrics) {
+    const byParentPostId = new Map();
+    for (const [userKey, user] of Object.entries(metrics?.users || {})) {
+      if (!user?.posts || isVirtualUserKey(userKey)) continue;
+      for (const [postId, post] of Object.entries(user.posts)) {
+        const parentPostId = typeof post?.parent_post_id === 'string' ? post.parent_post_id.trim() : '';
+        if (!parentPostId || parentPostId === postId) continue;
+        byParentPostId.set(parentPostId, mergeRemixPostIds(byParentPostId.get(parentPostId), [postId]));
+      }
+    }
+    return byParentPostId;
+  }
+
+  function materializeRemixPostIdsFromParentLinks(metrics) {
+    const parentRemixPostIndex = buildParentRemixPostIndex(metrics);
+    let updatedPosts = 0;
+    for (const [parentPostId, childPostIds] of parentRemixPostIndex.entries()) {
+      for (const user of Object.values(metrics?.users || {})) {
+        const parentPost = user?.posts?.[parentPostId];
+        if (!parentPost) continue;
+        const mergedRemixPostIds = mergeRemixPostIds(parentPost.remix_post_ids, childPostIds);
+        const previousRemixPostIds = Array.isArray(parentPost.remix_post_ids) ? parentPost.remix_post_ids : [];
+        const changed = mergedRemixPostIds.length !== previousRemixPostIds.length
+          || mergedRemixPostIds.some((remixPostId, index) => remixPostId !== previousRemixPostIds[index]);
+        if (!changed) continue;
+        parentPost.remix_post_ids = mergedRemixPostIds;
+        updatedPosts++;
+      }
+    }
+    return { updatedPosts, indexedParents: parentRemixPostIndex.size };
+  }
+
+  function normalizeRemixOwnerHandle(value) {
+    if (value == null) return '';
+    return String(value).trim().replace(/^@+/, '').toLowerCase();
+  }
+
+  function getTopRemixerLabel(entry) {
+    const handle = String(entry?.ownerHandle || '').trim();
+    if (handle) return handle;
+    const ownerId = entry?.ownerId != null ? String(entry.ownerId).trim() : '';
+    if (ownerId) return `User ${ownerId}`;
+    const ownerKey = String(entry?.ownerKey || '').trim();
+    if (ownerKey.startsWith('h:')) return ownerKey.slice(2);
+    if (ownerKey.startsWith('id:')) return `User ${ownerKey.slice(3)}`;
+    return ownerKey || 'Unknown';
+  }
+
+  function createRemixLeaderboardContext(metrics) {
+    const users = metrics?.users || {};
+    const canonicalById = new Map();
+    const canonicalByHandle = new Map();
+    const postCache = new Map();
+
+    function getCandidateHandle(userKey, user, ownerHandle = null) {
+      const normalized = normalizeRemixOwnerHandle(
+        ownerHandle
+        || user?.handle
+        || user?.userHandle
+        || (typeof userKey === 'string' && userKey.startsWith('h:') ? userKey.slice(2) : '')
+      );
+      return normalized || '';
+    }
+
+    function getCandidateId(userKey, user, ownerId = null) {
+      if (ownerId != null && String(ownerId).trim()) return String(ownerId).trim();
+      if (user?.id != null && String(user.id).trim()) return String(user.id).trim();
+      if (typeof userKey === 'string' && userKey.startsWith('id:')) return String(userKey.slice(3) || '').trim();
+      return '';
+    }
+
+    function buildCandidate(userKey, user, ownerHandle = null, ownerId = null) {
+      return {
+        key: userKey || null,
+        handle: getCandidateHandle(userKey, user, ownerHandle),
+        id: getCandidateId(userKey, user, ownerId),
+        postCount: Object.keys(user?.posts || {}).length
+      };
+    }
+
+    function candidateScore(candidate, targetHandle = '', targetId = '') {
+      if (!candidate) return -Infinity;
+      let score = 0;
+      if (targetId && candidate.id && candidate.id === targetId) score += 8;
+      if (targetHandle && candidate.handle && candidate.handle === targetHandle) score += 6;
+      if (targetHandle && String(candidate.key || '').startsWith('h:')) score += 2;
+      if (!targetHandle && targetId && String(candidate.key || '').startsWith('id:')) score += 1;
+      return score;
+    }
+
+    function preferCandidate(left, right, targetHandle = '', targetId = '') {
+      if (!left) return right || null;
+      if (!right) return left;
+      const leftScore = candidateScore(left, targetHandle, targetId);
+      const rightScore = candidateScore(right, targetHandle, targetId);
+      if (leftScore !== rightScore) return rightScore > leftScore ? right : left;
+      if (left.postCount !== right.postCount) return right.postCount > left.postCount ? right : left;
+      const leftHandleFilled = left.handle ? 1 : 0;
+      const rightHandleFilled = right.handle ? 1 : 0;
+      if (leftHandleFilled !== rightHandleFilled) return rightHandleFilled > leftHandleFilled ? right : left;
+      const leftIdFilled = left.id ? 1 : 0;
+      const rightIdFilled = right.id ? 1 : 0;
+      if (leftIdFilled !== rightIdFilled) return rightIdFilled > leftIdFilled ? right : left;
+      return String(right.key || '').localeCompare(String(left.key || '')) < 0 ? right : left;
+    }
+
+    for (const [userKey, user] of Object.entries(users)) {
+      if (!user || userKey === 'unknown' || isVirtualUserKey(userKey)) continue;
+      const candidate = buildCandidate(userKey, user);
+      if (candidate.id) canonicalById.set(candidate.id, preferCandidate(canonicalById.get(candidate.id), candidate, '', candidate.id));
+      if (candidate.handle) canonicalByHandle.set(candidate.handle, preferCandidate(canonicalByHandle.get(candidate.handle), candidate, candidate.handle, candidate.id));
+    }
+
+    function resolveOwnerIdentity({ ownerKey = null, ownerHandle = null, ownerId = null, bucketUser = null } = {}) {
+      const handle = getCandidateHandle(ownerKey, bucketUser, ownerHandle);
+      const id = getCandidateId(ownerKey, bucketUser, ownerId);
+      let candidate = null;
+      if (id) candidate = preferCandidate(candidate, canonicalById.get(id), handle, id);
+      if (handle) candidate = preferCandidate(candidate, canonicalByHandle.get(handle), handle, id);
+      if (!candidate && ownerKey && users[ownerKey] && !isVirtualUserKey(ownerKey)) {
+        candidate = buildCandidate(ownerKey, users[ownerKey], ownerHandle, ownerId);
+      }
+      const resolvedKey = candidate?.key || ownerKey || (id ? `id:${id}` : (handle ? `h:${handle}` : null));
+      const resolvedHandle = candidate?.handle || handle || null;
+      const resolvedId = candidate?.id || id || null;
+      if (!resolvedKey && !resolvedHandle && !resolvedId) return null;
+      return { ownerKey: resolvedKey, ownerHandle: resolvedHandle, ownerId: resolvedId };
+    }
+
+    function getSnapshotCount(post) {
+      return Array.isArray(post?.snapshots) ? post.snapshots.length : 0;
+    }
+
+    function getLatestSnapshotTs(post) {
+      const latest = latestSnapshot(post?.snapshots);
+      return toTs(latest?.t) || 0;
+    }
+
+    function chooseResolvedPost(left, right) {
+      if (!left) return right || null;
+      if (!right) return left;
+      const leftSnapshotCount = getSnapshotCount(left.post);
+      const rightSnapshotCount = getSnapshotCount(right.post);
+      if (leftSnapshotCount !== rightSnapshotCount) return rightSnapshotCount > leftSnapshotCount ? right : left;
+      const leftLatestTs = getLatestSnapshotTs(left.post);
+      const rightLatestTs = getLatestSnapshotTs(right.post);
+      if (leftLatestTs !== rightLatestTs) return rightLatestTs > leftLatestTs ? right : left;
+      const leftOwner = left.ownerIdentity?.ownerHandle ? 1 : 0;
+      const rightOwner = right.ownerIdentity?.ownerHandle ? 1 : 0;
+      if (leftOwner !== rightOwner) return rightOwner > leftOwner ? right : left;
+      const leftCaption = left.post?.caption ? 1 : 0;
+      const rightCaption = right.post?.caption ? 1 : 0;
+      if (leftCaption !== rightCaption) return rightCaption > leftCaption ? right : left;
+      const leftUrl = left.post?.url ? 1 : 0;
+      const rightUrl = right.post?.url ? 1 : 0;
+      if (leftUrl !== rightUrl) return rightUrl > leftUrl ? right : left;
+      return String(right.userKey || '').localeCompare(String(left.userKey || '')) < 0 ? right : left;
+    }
+
+    function resolvePostById(postId) {
+      if (!postId || typeof postId !== 'string') return null;
+      if (postCache.has(postId)) return postCache.get(postId);
+      let best = null;
+      for (const [userKey, user] of Object.entries(users)) {
+        if (!user?.posts || isVirtualUserKey(userKey)) continue;
+        const post = user.posts[postId];
+        if (!post) continue;
+        const ownerIdentity = resolveOwnerIdentity({
+          ownerKey: post.ownerKey || userKey,
+          ownerHandle: post.ownerHandle || user.handle || null,
+          ownerId: post.ownerId != null ? post.ownerId : user.id,
+          bucketUser: user
+        });
+        best = chooseResolvedPost(best, { userKey, post, ownerIdentity });
+      }
+      postCache.set(postId, best || null);
+      return best || null;
+    }
+
+    return { resolveOwnerIdentity, resolvePostById };
+  }
+
+  function sameTopRemixerIdentity(left, right) {
+    if (!left || !right) return false;
+    const leftId = left.ownerId != null ? String(left.ownerId).trim() : '';
+    const rightId = right.ownerId != null ? String(right.ownerId).trim() : '';
+    if (leftId && rightId && leftId === rightId) return true;
+    const leftHandle = normalizeRemixOwnerHandle(left.ownerHandle);
+    const rightHandle = normalizeRemixOwnerHandle(right.ownerHandle);
+    if (leftHandle && rightHandle && leftHandle === rightHandle) return true;
+    return !!left.ownerKey && !!right.ownerKey && left.ownerKey === right.ownerKey;
+  }
+
+  function computeTopRemixersStats(metrics, userKey, user, visibleSet, limit = 20) {
+    const postEntries = user?.posts && typeof user.posts === 'object'
+      ? Object.entries(user.posts)
+      : [];
+    const safeLimit = Math.max(1, Number(limit) || 20);
+    const stats = {
+      totalSourcePosts: 0,
+      postsWithRemixes: 0,
+      totalRemixPosts: 0,
+      uniqueRemixers: 0,
+      rows: []
+    };
+    if (!postEntries.length) return stats;
+    const { resolveOwnerIdentity, resolvePostById } = createRemixLeaderboardContext(metrics);
+    const fallbackRemixPostIdsByParent = buildParentRemixPostIndex(metrics);
+    const remixerMap = new Map();
+    for (const [pid, post] of postEntries) {
+      if (visibleSet instanceof Set && !visibleSet.has(pid)) continue;
+      stats.totalSourcePosts++;
+      const directRemixPostIds = normalizeRemixPostIds(post?.remix_post_ids);
+      const remixPostIds = directRemixPostIds.length ? directRemixPostIds : (fallbackRemixPostIdsByParent.get(pid) || []);
+      if (!remixPostIds.length) continue;
+      const sourceOwnerIdentity = resolveOwnerIdentity({
+        ownerKey: post?.ownerKey || userKey || null,
+        ownerHandle: post?.ownerHandle || user?.handle || null,
+        ownerId: post?.ownerId != null ? post.ownerId : user?.id,
+        bucketUser: user
+      });
+      let sourceCounted = false;
+      for (const remixPostId of remixPostIds) {
+        const resolvedRemixPost = resolvePostById(remixPostId);
+        const remixerIdentity = resolvedRemixPost?.ownerIdentity;
+        if (!remixerIdentity) continue;
+        if (sourceOwnerIdentity && sameTopRemixerIdentity(sourceOwnerIdentity, remixerIdentity)) continue;
+        const rowKey = remixerIdentity.ownerKey
+          || (remixerIdentity.ownerId != null ? `id:${String(remixerIdentity.ownerId).trim()}` : '')
+          || (remixerIdentity.ownerHandle ? `h:${normalizeRemixOwnerHandle(remixerIdentity.ownerHandle)}` : '');
+        if (!rowKey) continue;
+        sourceCounted = true;
+        stats.totalRemixPosts++;
+        const row = remixerMap.get(rowKey) || {
+          ownerKey: rowKey,
+          ownerHandle: remixerIdentity.ownerHandle || null,
+          ownerId: remixerIdentity.ownerId ?? null,
+          count: 0
+        };
+        row.count += 1;
+        if (!row.ownerHandle && remixerIdentity.ownerHandle) row.ownerHandle = remixerIdentity.ownerHandle;
+        if (row.ownerId == null && remixerIdentity.ownerId != null) row.ownerId = remixerIdentity.ownerId;
+        remixerMap.set(rowKey, row);
+      }
+      if (sourceCounted) stats.postsWithRemixes++;
+    }
+    const rows = Array.from(remixerMap.values()).sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return getTopRemixerLabel(a).localeCompare(getTopRemixerLabel(b));
+    });
+    stats.uniqueRemixers = rows.length;
+    stats.rows = rows.slice(0, safeLimit);
+    return stats;
   }
 
   function computeDiscoveryKeywordStats(user, visibleSet, limit = 12) {
@@ -6251,12 +6533,14 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       metrics = await loadMetrics();
       await ensureFullSnapshots();
       if (warnIfSnapshotHydrationIncomplete('Full backup export')) return;
+      const exportMetrics = JSON.parse(JSON.stringify(metrics || { users: {} }));
+      materializeRemixPostIdsFromParentLinks(exportMetrics);
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
       const payload = {
         format: 'sora-creator-tools/raw-backup-v1',
         exportedAt: new Date().toISOString(),
         snapshotsHydrated: !!snapshotsHydrated,
-        metrics: metrics || { users: {} },
+        metrics: exportMetrics,
       };
       triggerDownload(
         `${JSON.stringify(payload, null, 2)}\n`,
@@ -6685,6 +6969,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const existing = Array.isArray(out.cameo_usernames) ? out.cameo_usernames : [];
       out.cameo_usernames = Array.from(new Set(existing.concat(source.cameo_usernames).filter(Boolean)));
     }
+    const nextRemixPostIds = mergeRemixPostIds(out.remix_post_ids, source.remix_post_ids);
+    if (nextRemixPostIds.length) out.remix_post_ids = nextRemixPostIds;
     if (Number.isFinite(Number(source.duration))) out.duration = Number(source.duration);
     if (Number.isFinite(Number(source.width))) out.width = Number(source.width);
     if (Number.isFinite(Number(source.height))) out.height = Number(source.height);
@@ -6879,6 +7165,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (!user.posts[postId]) {
           const nextPost = JSON.parse(JSON.stringify(rawPost));
           nextPost.snapshots = mergeSnapshotsByTimestamp([], incomingSnaps);
+          const nextRemixPostIds = mergeRemixPostIds([], rawPost.remix_post_ids);
+          if (nextRemixPostIds.length) nextPost.remix_post_ids = nextRemixPostIds;
+          else delete nextPost.remix_post_ids;
           if (nextPost.post_time) nextPost.post_time = toTs(nextPost.post_time) || nextPost.post_time;
           if (nextPost.lastSeen) nextPost.lastSeen = toTs(nextPost.lastSeen) || nextPost.lastSeen;
           user.posts[postId] = nextPost;
@@ -6902,6 +7191,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         if (Array.isArray(rawPost.cameo_usernames) && rawPost.cameo_usernames.length) {
           post.cameo_usernames = rawPost.cameo_usernames.slice();
         }
+        const nextRemixPostIds = mergeRemixPostIds(post.remix_post_ids, rawPost.remix_post_ids);
+        if (nextRemixPostIds.length) post.remix_post_ids = nextRemixPostIds;
         if (Number.isFinite(Number(rawPost.duration))) post.duration = Number(rawPost.duration);
         if (Number.isFinite(Number(rawPost.width))) post.width = Number(rawPost.width);
         if (Number.isFinite(Number(rawPost.height))) post.height = Number(rawPost.height);
@@ -6927,6 +7218,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         }
       }
     }
+
+    materializeRemixPostIdsFromParentLinks(metrics);
 
     return true;
   }
@@ -6981,6 +7274,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const sectionRows = lines.slice(dataStartIdx).filter(r => r && r.trim());
       await processSection(currentSection, headerRow, sectionRows, metrics, stats);
     }
+    materializeRemixPostIdsFromParentLinks(metrics);
     return true;
   }
 
@@ -7106,6 +7400,15 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         const ownerId = getCol('Owner ID') || userId;
         const parentPostId = getCol('Parent Post ID') || '';
         const rootPostId = getCol('Root Post ID') || '';
+        const remixPostIdsRaw = getCol('Remix Post IDs') || '';
+        let remixPostIds = [];
+        if (remixPostIdsRaw) {
+          try {
+            remixPostIds = normalizeRemixPostIds(JSON.parse(remixPostIdsRaw));
+          } catch {
+            remixPostIds = normalizeRemixPostIds(remixPostIdsRaw.split(','));
+          }
+        }
         const lastSeenISO = getCol('Last Seen Timestamp');
         const lastSeen = parseTimestamp(lastSeenISO);
         
@@ -7130,6 +7433,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             ownerId: ownerId || null,
             parent_post_id: parentPostId || null,
             root_post_id: rootPostId || null,
+            remix_post_ids: remixPostIds.length ? remixPostIds : null,
             lastSeen: lastSeen || null
           };
           stats.postsAdded++;
@@ -7145,6 +7449,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           if (!post.ownerId && ownerId) post.ownerId = ownerId;
           if (!post.parent_post_id && parentPostId) post.parent_post_id = parentPostId;
           if (!post.root_post_id && rootPostId) post.root_post_id = rootPostId;
+          const mergedRemixPostIds = mergeRemixPostIds(post.remix_post_ids, remixPostIds);
+          if (mergedRemixPostIds.length) post.remix_post_ids = mergedRemixPostIds;
           if (!post.lastSeen && lastSeen) post.lastSeen = lastSeen;
           stats.postsUpdated++;
         }
@@ -7452,6 +7758,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const discoveryKeywordsEmpty = $('#discoveryKeywordsEmpty');
     const discoveryKeywordsBars = $('#discoveryKeywordsBars');
     const discoveryKeywordsCloud = $('#discoveryKeywordsCloud');
+    const topRemixersStats = $('#topRemixersStats');
+    const topRemixersBody = $('#topRemixersBody');
     const PRESET_VISIBILITY_ACTIONS = new Set([
       'pastDay',
       'pastWeek',
@@ -9924,6 +10232,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       viewsPerMinuteChart.setData([]);
       viewsPerMinuteTimeChart.setData([]);
       renderDiscoveryPhraseKeywords(null, null);
+      renderTopRemixersPanel(null, null);
       return;
     }
         // No precompute needed for IR; use latest available remix count only for cards
@@ -10236,6 +10545,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             }
             refreshPerMinuteCharts(user, visibleSet);
             renderDiscoveryPhraseKeywords(user, visibleSet);
+            renderTopRemixersPanel(user, visibleSet);
             // Only update compare charts if no compare users are selected
             if (compareUsers.size === 0){
               // Update unfiltered totals cards for single user
@@ -10334,7 +10644,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           if (z.viewsAll) allViewsChart.setZoom(z.viewsAll);
         } catch {}
       }
-      applyDefaultInteractionRateZoom(currentUserKey);
+      applyDefaultInteractionRateZoom(currentUserKey, user, visibleSet);
       // Sync chart hover back to list - use current chart instances
       const hoverCharts = [
         chart,
@@ -10778,13 +11088,52 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       if (primaryViewsAxis) primaryViewsAxis.textContent = viewsLabel;
     }
 
-    function applyDefaultInteractionRateZoom(userKey){
+    function computeDefaultInteractionRateZoomMax(user, visibleIds){
+      const values = [];
+      for (const [pid, post] of Object.entries(user?.posts || {})) {
+        if (visibleIds instanceof Set && !visibleIds.has(pid)) continue;
+        for (const snap of Array.isArray(post?.snapshots) ? post.snapshots : []) {
+          const rate = Number(interactionRate(snap));
+          if (Number.isFinite(rate) && rate >= 0) values.push(rate);
+        }
+      }
+      if (!values.length) return INTERACTION_RATE_DEFAULT_ZOOM_Y_MAX;
+      values.sort((a, b) => a - b);
+      const quantile = (q) => {
+        if (!values.length) return 0;
+        const index = (values.length - 1) * clamp(Number(q) || 0, 0, 1);
+        const lower = Math.floor(index);
+        const upper = Math.ceil(index);
+        if (lower === upper) return values[lower];
+        const weight = index - lower;
+        return values[lower] + (values[upper] - values[lower]) * weight;
+      };
+      const p95 = quantile(0.95);
+      const p98 = quantile(0.98);
+      const actualMax = values[values.length - 1] || 0;
+      const robustReference = Math.max(p95, p98, INTERACTION_RATE_DEFAULT_ZOOM_Y_MAX);
+      const shouldIgnoreExtremeOutlier = actualMax > INTERACTION_RATE_DEFAULT_ZOOM_Y_MAX
+        && robustReference > 0
+        && actualMax / robustReference > 2.5;
+      const targetMax = shouldIgnoreExtremeOutlier ? p98 : actualMax;
+      const paddedMax = Math.max(INTERACTION_RATE_DEFAULT_ZOOM_Y_MAX, targetMax * 1.08);
+      if (paddedMax <= 10) return Math.ceil(paddedMax * 2) / 2;
+      if (paddedMax <= 30) return Math.ceil(paddedMax);
+      return Math.ceil(paddedMax / 5) * 5;
+    }
+
+    function applyDefaultInteractionRateZoom(userKey, user = null, visibleIds = null){
       if (!userKey || !chart || !interactionRateStackedChart) return;
       if (defaultInteractionZoomApplied.has(userKey)) return;
+      const resolvedUser = user
+        || (currentUserKey
+          ? (buildMergedIdentityUser(metrics, currentUserKey, resolveUserForKey(metrics, currentUserKey))?.user || resolveUserForKey(metrics, currentUserKey))
+          : null);
+      const nextYMax = computeDefaultInteractionRateZoomMax(resolvedUser, visibleIds instanceof Set ? visibleIds : visibleSet);
       chart.resetZoom();
       interactionRateStackedChart.resetZoom();
-      chart.setZoom({ y: [0, INTERACTION_RATE_DEFAULT_ZOOM_Y_MAX] });
-      interactionRateStackedChart.setZoom({ y: [0, INTERACTION_RATE_DEFAULT_ZOOM_Y_MAX] });
+      chart.setZoom({ y: [0, nextYMax] });
+      interactionRateStackedChart.setZoom({ y: [0, nextYMax] });
       defaultInteractionZoomApplied.add(userKey);
     }
 
@@ -10936,6 +11285,34 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     function renderDiscoveryPhraseKeywords(user, visibleSet){
       const stats = computeDiscoveryKeywordStats(user, visibleSet, 12);
       renderDiscoveryKeywordViz(stats);
+    }
+
+    function renderTopRemixersPanel(user, visibleSet) {
+      if (!topRemixersStats || !topRemixersBody) return;
+      if (!user || !user.posts) {
+        topRemixersStats.textContent = 'Select a profile to view remixers.';
+        topRemixersBody.innerHTML = '<tr class="top-remixers-empty"><td colspan="3">Select a profile to view remixers.</td></tr>';
+        return;
+      }
+      const stats = computeTopRemixersStats(metrics, currentUserKey, user, visibleSet, 20);
+      if (stats.totalSourcePosts <= 0) {
+        topRemixersStats.textContent = 'No visible posts selected yet.';
+        topRemixersBody.innerHTML = '<tr class="top-remixers-empty"><td colspan="3">No visible posts selected yet.</td></tr>';
+        return;
+      }
+      if (!stats.rows.length) {
+        topRemixersStats.textContent = `${fmt(stats.totalSourcePosts)} visible posts selected.`;
+        topRemixersBody.innerHTML = '<tr class="top-remixers-empty"><td colspan="3">No remixers found for the current post filter.</td></tr>';
+        return;
+      }
+      topRemixersStats.textContent = `${fmt(stats.totalRemixPosts)} remix posts from ${fmt(stats.uniqueRemixers)} remixers across ${fmt(stats.postsWithRemixes)} visible source posts.`;
+      topRemixersBody.innerHTML = stats.rows.map((row, index) => `
+        <tr>
+          <td>${index + 1}</td>
+          <td><span class="top-remixers-user">${esc(getTopRemixerLabel(row))}</span></td>
+          <td>${fmt(row.count)}</td>
+        </tr>
+      `).join('');
     }
 
     function setDiscoveryKeywordVizMode(mode, opts = {}){

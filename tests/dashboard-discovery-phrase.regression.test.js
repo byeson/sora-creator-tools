@@ -66,10 +66,46 @@ function buildLineHarness() {
   const snippet = extractBetween('function normalizeDiscoveryPhrase(value) {', 'function truncateForPurgeCaption(text){');
   const context = {};
   const bootstrap = `
+    function latestSnapshot(snaps){
+      if (!Array.isArray(snaps) || snaps.length === 0) return null;
+      let best = null;
+      let bestT = -Infinity;
+      let sawT = false;
+      for (const snap of snaps) {
+        const t = Number(snap?.t);
+        if (Number.isFinite(t)) {
+          sawT = true;
+          if (t > bestT) {
+            bestT = t;
+            best = snap;
+          }
+        }
+      }
+      return (sawT && best) ? best : (snaps[snaps.length - 1] || null);
+    }
+    function toTs(value) {
+      if (typeof value === 'number' && Number.isFinite(value)) return value < 1e11 ? value * 1000 : value;
+      if (typeof value === 'string' && value.trim()) {
+        const text = value.trim();
+        if (/^\\d+$/.test(text)) {
+          const parsed = Number(text);
+          return parsed < 1e11 ? parsed * 1000 : parsed;
+        }
+        const parsedDate = Date.parse(text);
+        if (!Number.isNaN(parsedDate)) return parsedDate;
+      }
+      return 0;
+    }
+    function isTopTodayKey(key) { return key === '__top_today__'; }
+    function isCameoKey(key) { return typeof key === 'string' && key.startsWith('c:'); }
+    function isVirtualUserKey(key) { return isTopTodayKey(key) || isCameoKey(key); }
     ${snippet}
     globalThis.__normalizeDiscoveryPhrase = normalizeDiscoveryPhrase;
     globalThis.__buildDiscoveryPhraseLine = buildDiscoveryPhraseLine;
     globalThis.__extractDiscoveryPhraseKeywords = extractDiscoveryPhraseKeywords;
+    globalThis.__normalizeRemixPostIds = normalizeRemixPostIds;
+    globalThis.__mergeRemixPostIds = mergeRemixPostIds;
+    globalThis.__computeTopRemixersStats = computeTopRemixersStats;
     globalThis.__computeDiscoveryKeywordStats = computeDiscoveryKeywordStats;
   `;
   vm.createContext(context);
@@ -78,6 +114,9 @@ function buildLineHarness() {
     normalizeDiscoveryPhrase: context.__normalizeDiscoveryPhrase,
     buildDiscoveryPhraseLine: context.__buildDiscoveryPhraseLine,
     extractDiscoveryPhraseKeywords: context.__extractDiscoveryPhraseKeywords,
+    normalizeRemixPostIds: context.__normalizeRemixPostIds,
+    mergeRemixPostIds: context.__mergeRemixPostIds,
+    computeTopRemixersStats: context.__computeTopRemixersStats,
     computeDiscoveryKeywordStats: context.__computeDiscoveryKeywordStats,
   };
 }
@@ -142,6 +181,7 @@ function computeTotalsForUser(user) {
 }
 
 function buildExportHarness(metricsFixture, opts = {}) {
+  const remixHelpers = extractBetween('function normalizeRemixPostIds(value) {', '\n  function normalizeRemixOwnerHandle(value) {');
   const snippet = extractBetween('function escapeCSV(str) {', '\n  // Parse CSV line handling quoted fields');
   const state = {
     blob: null,
@@ -170,6 +210,9 @@ function buildExportHarness(metricsFixture, opts = {}) {
   };
   const bootstrap = `
     const SITE_ORIGIN = 'https://sora.chatgpt.com';
+    function isTopTodayKey(key) { return key === '__top_today__'; }
+    function isCameoKey(key) { return typeof key === 'string' && key.startsWith('c:'); }
+    function isVirtualUserKey(key) { return isTopTodayKey(key) || isCameoKey(key); }
     const SNAP_DEBUG_ENABLED = !!globalThis.__snapshotDebugEnabled;
     let metrics = { users: {} };
     let snapshotsHydrated = false;
@@ -192,6 +235,7 @@ function buildExportHarness(metricsFixture, opts = {}) {
     const likeRate = globalThis.__likeRate;
     const computeTotalsForUser = globalThis.__computeTotalsForUser;
     const toTs = globalThis.__toTs;
+    ${remixHelpers}
     const alert = (message) => {
       globalThis.__state.alerts.push(message);
       if (globalThis.__throwOnAlert) throw new Error(message || 'unexpected alert during export');
@@ -250,6 +294,7 @@ function buildExportHarness(metricsFixture, opts = {}) {
 
 function buildImportHarness() {
   const snapshotMergeHelpers = extractBetween('function mergeSnapshotPoint(existing, incoming){', '\n  // Strict post time lookup: only consider explicit post time fields; everything else sorts last');
+  const remixHelpers = extractBetween('function normalizeRemixPostIds(value) {', '\n  function normalizeRemixOwnerHandle(value) {');
   const snippet = extractBetween('function parseCSVLine(line) {', '\n  async function main(prefetchedCache){');
   const context = {
     __toTs: toTs,
@@ -258,7 +303,11 @@ function buildImportHarness() {
     const SITE_ORIGIN = 'https://sora.chatgpt.com';
     const SNAP_DEBUG_ENABLED = false;
     const toTs = globalThis.__toTs;
+    function isTopTodayKey(key) { return key === '__top_today__'; }
+    function isCameoKey(key) { return typeof key === 'string' && key.startsWith('c:'); }
+    function isVirtualUserKey(key) { return isTopTodayKey(key) || isCameoKey(key); }
     ${snapshotMergeHelpers}
+    ${remixHelpers}
     ${snippet}
     globalThis.__importDataCSVText = importDataCSVText;
     globalThis.__importDataText = importDataText;
@@ -333,6 +382,148 @@ test('computeDiscoveryKeywordStats ignores posts without discovery phrases', () 
       ['pottery', 1]
     ]
   );
+});
+
+test('computeTopRemixersStats merges alias remixers and excludes self-remixes', () => {
+  const { computeTopRemixersStats } = buildLineHarness();
+  const metrics = {
+    users: {
+      'h:alice': {
+        handle: 'alice',
+        id: 'user-alice',
+        posts: {
+          s_parent_a: {
+            ownerKey: 'h:alice',
+            ownerHandle: 'alice',
+            ownerId: 'user-alice',
+            remix_post_ids: ['s_child_bob_1', 's_child_bob_2', 's_child_self'],
+            snapshots: [{ t: 1773541000000, uv: 10 }]
+          },
+          s_parent_b: {
+            ownerKey: 'h:alice',
+            ownerHandle: 'alice',
+            ownerId: 'user-alice',
+            remix_post_ids: ['s_child_carol'],
+            snapshots: [{ t: 1773542000000, uv: 12 }]
+          }
+        }
+      },
+      'id:user-alice': {
+        handle: 'alice',
+        id: 'user-alice',
+        posts: {
+          s_child_self: {
+            ownerKey: 'id:user-alice',
+            ownerHandle: 'alice',
+            ownerId: 'user-alice',
+            snapshots: [{ t: 1773542100000, uv: 2 }]
+          }
+        }
+      },
+      'id:user-bob': {
+        handle: 'bob',
+        id: 'user-bob',
+        posts: {
+          s_child_bob_1: {
+            ownerKey: 'id:user-bob',
+            ownerHandle: 'bob',
+            ownerId: 'user-bob',
+            snapshots: [{ t: 1773543000000, uv: 5 }]
+          }
+        }
+      },
+      'h:bob': {
+        handle: 'bob',
+        id: 'user-bob',
+        posts: {
+          s_child_bob_2: {
+            ownerKey: 'h:bob',
+            ownerHandle: 'bob',
+            ownerId: 'user-bob',
+            snapshots: [{ t: 1773544000000, uv: 6 }]
+          }
+        }
+      },
+      'h:carol': {
+        handle: 'carol',
+        id: 'user-carol',
+        posts: {
+          s_child_carol: {
+            ownerKey: 'h:carol',
+            ownerHandle: 'carol',
+            ownerId: 'user-carol',
+            snapshots: [{ t: 1773545000000, uv: 7 }]
+          }
+        }
+      }
+    }
+  };
+
+  const stats = computeTopRemixersStats(
+    metrics,
+    'h:alice',
+    metrics.users['h:alice'],
+    new Set(['s_parent_a', 's_parent_b']),
+    10
+  );
+
+  assert.equal(stats.totalSourcePosts, 2);
+  assert.equal(stats.postsWithRemixes, 2);
+  assert.equal(stats.totalRemixPosts, 3);
+  assert.equal(stats.uniqueRemixers, 2);
+  assert.deepEqual(
+    toPlainJson(stats.rows.map((row) => [row.ownerHandle, row.count])),
+    [
+      ['bob', 2],
+      ['carol', 1]
+    ]
+  );
+});
+
+test('computeTopRemixersStats falls back to child parent_post_id links when parent remix arrays are missing', () => {
+  const { computeTopRemixersStats } = buildLineHarness();
+  const metrics = {
+    users: {
+      'h:alice': {
+        handle: 'alice',
+        id: 'user-alice',
+        posts: {
+          s_parent_a: {
+            ownerKey: 'h:alice',
+            ownerHandle: 'alice',
+            ownerId: 'user-alice',
+            snapshots: [{ t: 1773541000000, uv: 10 }]
+          }
+        }
+      },
+      'h:bob': {
+        handle: 'bob',
+        id: 'user-bob',
+        posts: {
+          s_child_bob: {
+            ownerKey: 'h:bob',
+            ownerHandle: 'bob',
+            ownerId: 'user-bob',
+            parent_post_id: 's_parent_a',
+            snapshots: [{ t: 1773543000000, uv: 5 }]
+          }
+        }
+      }
+    }
+  };
+
+  const stats = computeTopRemixersStats(
+    metrics,
+    'h:alice',
+    metrics.users['h:alice'],
+    new Set(['s_parent_a']),
+    10
+  );
+
+  assert.equal(stats.totalSourcePosts, 1);
+  assert.equal(stats.totalRemixPosts, 1);
+  assert.equal(stats.uniqueRemixers, 1);
+  assert.deepEqual(toPlainJson(stats.rows.map((row) => [row.ownerHandle, row.count])), [['bob', 1]]);
 });
 
 test('exportAllDataCSV includes discovery phrase columns and values', async () => {
@@ -508,6 +699,48 @@ test('exports use hydrated metrics after ensureFullSnapshots adds historical sna
   assert.equal(csvText.includes(`,2,${firstSnapshotIso},${lastSnapshotIso}`), true);
 });
 
+test('exportRawBackupJSON backfills parent remix_post_ids from child parent_post_id links', async () => {
+  const metricsFixture = {
+    users: {
+      'h:alice': {
+        handle: 'alice',
+        id: 'user-alice',
+        posts: {
+          s_parent: {
+            ownerKey: 'h:alice',
+            ownerHandle: 'alice',
+            ownerId: 'user-alice',
+            snapshots: [{ t: 1773541000000, uv: 10 }]
+          }
+        },
+        followers: [],
+        cameos: [],
+      },
+      'h:bob': {
+        handle: 'bob',
+        id: 'user-bob',
+        posts: {
+          s_child: {
+            ownerKey: 'h:bob',
+            ownerHandle: 'bob',
+            ownerId: 'user-bob',
+            parent_post_id: 's_parent',
+            snapshots: [{ t: 1773542000000, uv: 5 }]
+          }
+        },
+        followers: [],
+        cameos: [],
+      }
+    }
+  };
+
+  const harness = buildExportHarness(metricsFixture);
+  await harness.exportRawBackupJSON();
+  const payload = JSON.parse(harness.state.blob.parts.join(''));
+
+  assert.deepEqual(payload.metrics.users['h:alice'].posts.s_parent.remix_post_ids, ['s_child']);
+});
+
 test('raw backup JSON survives export/import round-trip through dashboard backup format', async () => {
   const metricsFixture = {
     users: {
@@ -522,6 +755,7 @@ test('raw backup JSON survives export/import round-trip through dashboard backup
             caption: 'Delft Pug',
             discovery_phrase: 'delft pottery organ pug',
             cameo_usernames: ['bob', 'carol'],
+            remix_post_ids: ['s_child_1', 's_child_2'],
             duration: 12.5,
             width: 1920,
             height: 1080,
@@ -561,12 +795,71 @@ test('raw backup JSON survives export/import round-trip through dashboard backup
   assert.equal(importedMetrics.users['h:alice'].posts['s_123'].duration, 12.5);
   assert.equal(importedMetrics.users['h:alice'].posts['s_123'].width, 1920);
   assert.equal(importedMetrics.users['h:alice'].posts['s_123'].height, 1080);
+  assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].remix_post_ids), ['s_child_1', 's_child_2']);
   assert.deepEqual(
     toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].snapshots.map((snap) => snap.t)),
     [1773541932509, 1773542932509]
   );
   assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].followers), [{ t: 1773541000000, count: 321 }]);
   assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].cameos), [{ t: 1773541000000, count: 12 }]);
+});
+
+test('raw backup JSON import backfills parent remix_post_ids from child parent_post_id links', async () => {
+  const importHarness = buildImportHarness();
+  const importedBackup = JSON.stringify({
+    format: 'sora-creator-tools/raw-backup-v1',
+    metrics: {
+      users: {
+        'h:alice': {
+          handle: 'alice',
+          id: 'user-alice',
+          followers: [],
+          cameos: [],
+          posts: {
+            s_parent: {
+              url: 'https://sora.chatgpt.com/p/s_parent',
+              caption: 'Parent',
+              post_time: 1773541000000,
+              snapshots: [{ t: 1773541000000, uv: 10 }]
+            }
+          }
+        },
+        'h:bob': {
+          handle: 'bob',
+          id: 'user-bob',
+          followers: [],
+          cameos: [],
+          posts: {
+            s_child: {
+              url: 'https://sora.chatgpt.com/p/s_child',
+              caption: 'Child',
+              parent_post_id: 's_parent',
+              post_time: 1773542000000,
+              snapshots: [{ t: 1773542000000, uv: 5 }]
+            }
+          }
+        }
+      }
+    }
+  });
+
+  const metrics = { users: {} };
+  const stats = {
+    postsAdded: 0,
+    postsUpdated: 0,
+    snapshotsAdded: 0,
+    snapshotsSkipped: 0,
+    followersAdded: 0,
+    followersSkipped: 0,
+    cameosAdded: 0,
+    cameosSkipped: 0,
+    usersAdded: 0,
+    usersUpdated: 0,
+  };
+
+  const didImport = await importHarness.importDataText(importedBackup, metrics, stats);
+  assert.equal(didImport, true);
+  assert.deepEqual(toPlainJson(metrics.users['h:alice'].posts.s_parent.remix_post_ids), ['s_child']);
 });
 
 test('raw backup JSON import merges alias user buckets into one identity', async () => {

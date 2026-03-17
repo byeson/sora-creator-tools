@@ -15,6 +15,7 @@
   const MAX_HANDLE_LEN = 80;
   const MAX_REQUEST_ID_LEN = 80;
   const MAX_CAMEO_USERNAMES = 32;
+  const MAX_REMIX_POST_IDS_PER_POST = 300;
 
   function sanitizeString(value, maxLen = MAX_STR_LEN) {
     if (typeof value !== 'string') return null;
@@ -52,6 +53,20 @@
       out.push(username);
     }
     return out;
+  }
+
+  function sanitizeRemixPostIds(value) {
+    if (!Array.isArray(value)) return null;
+    const out = [];
+    const seen = new Set();
+    for (const raw of value) {
+      if (out.length >= MAX_REMIX_POST_IDS_PER_POST) break;
+      const remixPostId = sanitizeIdToken(raw, MAX_ID_LEN);
+      if (!remixPostId || seen.has(remixPostId)) continue;
+      seen.add(remixPostId);
+      out.push(remixPostId);
+    }
+    return out.length ? out : null;
   }
 
   function sanitizeMetricsItem(raw) {
@@ -100,6 +115,8 @@
 
     const cameoUsernames = sanitizeCameoUsernames(raw.cameo_usernames);
     if (cameoUsernames) item.cameo_usernames = cameoUsernames;
+    const remixPostIds = sanitizeRemixPostIds(raw.remix_post_ids);
+    if (remixPostIds) item.remix_post_ids = remixPostIds;
 
     const uv = sanitizeNumber(raw.uv, 0);
     if (uv != null) item.uv = uv;

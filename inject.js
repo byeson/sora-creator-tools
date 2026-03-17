@@ -6153,6 +6153,18 @@ async function renderAnalyzeTable(force = false) {
       // Get duration and dimensions that were just extracted above
       const duration = idToDuration.get(id);
       const dimensions = idToDimensions.get(id);
+      const remixPostsData = p?.remix_posts || it?.remix_posts;
+      const remixPosts = Array.isArray(remixPostsData)
+        ? remixPostsData
+        : (Array.isArray(remixPostsData?.items) ? remixPostsData.items : []);
+      const remixPostIds = [];
+      const seenRemixPostIds = new Set();
+      for (const remixItem of remixPosts) {
+        const remixId = getItemId(remixItem);
+        if (!remixId || seenRemixPostIds.has(remixId)) continue;
+        seenRemixPostIds.add(remixId);
+        remixPostIds.push(remixId);
+      }
 
       batch.push({
         postId: id,
@@ -6177,6 +6189,7 @@ async function renderAnalyzeTable(force = false) {
         userKey,
         parent_post_id: p?.parent_post_id ?? null,
         root_post_id: p?.root_post_id ?? null,
+        remix_post_ids: remixPostIds.length > 0 ? remixPostIds : undefined,
         pageUserHandle,
         pageUserKey,
         duration: duration || null,
@@ -6185,12 +6198,6 @@ async function renderAnalyzeTable(force = false) {
       });
       
       // Also process remix_posts (child remixes) to make their data available when clicked
-      // remix_posts can be either an array OR an object with items array
-      const remixPostsData = p?.remix_posts || it?.remix_posts;
-      const remixPosts = Array.isArray(remixPostsData) 
-        ? remixPostsData 
-        : (Array.isArray(remixPostsData?.items) ? remixPostsData.items : []);
-      
       if (remixPosts.length > 0) {
         for (const remixItem of remixPosts) {
           const remixId = getItemId(remixItem);

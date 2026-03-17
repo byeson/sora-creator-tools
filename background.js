@@ -14,6 +14,7 @@ const TRUSTED_TAB_URL_RE = /^https:\/\/sora\.chatgpt\.com\//i;
 const MAX_MESSAGE_BATCH_ITEMS = 250;
 const MAX_SNAPSHOT_HISTORY_PER_POST = 720;
 const MAX_PROFILE_SERIES_POINTS = 720;
+const MAX_REMIX_POST_IDS_PER_POST = 300;
 
 // Debug toggles
 const DEBUG = { storage: false, thumbs: false };
@@ -82,6 +83,34 @@ function sanitizeCameoUsernames(value) {
   return out;
 }
 
+function sanitizeRemixPostIds(value) {
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  const seen = new Set();
+  for (const raw of value) {
+    if (out.length >= MAX_REMIX_POST_IDS_PER_POST) break;
+    const remixPostId = sanitizeIdToken(raw);
+    if (!remixPostId || seen.has(remixPostId)) continue;
+    seen.add(remixPostId);
+    out.push(remixPostId);
+  }
+  return out.length ? out : null;
+}
+
+function mergeRemixPostIds(existing, incoming) {
+  const out = Array.isArray(existing) ? existing.filter((value) => typeof value === 'string' && value) : [];
+  const seen = new Set(out);
+  for (const remixPostId of Array.isArray(incoming) ? incoming : []) {
+    if (typeof remixPostId !== 'string' || !remixPostId || seen.has(remixPostId)) continue;
+    seen.add(remixPostId);
+    out.push(remixPostId);
+  }
+  if (out.length > MAX_REMIX_POST_IDS_PER_POST) {
+    return out.slice(out.length - MAX_REMIX_POST_IDS_PER_POST);
+  }
+  return out;
+}
+
 function sanitizeMetricsSnapshot(raw) {
   if (!isPlainObject(raw)) return null;
   const snap = {};
@@ -128,6 +157,8 @@ function sanitizeMetricsSnapshot(raw) {
 
   const cameoUsernames = sanitizeCameoUsernames(raw.cameo_usernames);
   if (cameoUsernames) snap.cameo_usernames = cameoUsernames;
+  const remixPostIds = sanitizeRemixPostIds(raw.remix_post_ids);
+  if (remixPostIds) snap.remix_post_ids = remixPostIds;
 
   const uv = sanitizeNumber(raw.uv, 0);
   if (uv != null) snap.uv = uv;
@@ -410,6 +441,7 @@ function trimPostForResponse(post, snapshotMode) {
     width: post.width ?? null,
     height: post.height ?? null,
     cameo_usernames: post.cameo_usernames ?? null,
+    remix_post_ids: Array.isArray(post.remix_post_ids) && post.remix_post_ids.length > 0 ? post.remix_post_ids : null,
     snapshots,
   };
 }
@@ -607,6 +639,50 @@ async function flush() {
           // Relationship fields for deriving direct remix counts across metrics
           if (snap.parent_post_id != null && post.parent_post_id !== snap.parent_post_id) { post.parent_post_id = snap.parent_post_id; dirty = true; }
           if (snap.root_post_id != null && post.root_post_id !== snap.root_post_id) { post.root_post_id = snap.root_post_id; dirty = true; }
+          if (Array.isArray(snap.remix_post_ids) && snap.remix_post_ids.length > 0) {
+            const mergedRemixPostIds = mergeRemixPostIds(post.remix_post_ids, snap.remix_post_ids);
+            const previousRemixPostIds = Array.isArray(post.remix_post_ids) ? post.remix_post_ids : [];
+            const changed = mergedRemixPostIds.length !== previousRemixPostIds.length
+              || mergedRemixPostIds.some((remixPostId, index) => remixPostId !== previousRemixPostIds[index]);
+            if (changed) {
+              post.remix_post_ids = mergedRemixPostIds;
+              dirty = true;
+            }
+          }
+
+          // Persist reverse links so the parent post can later attribute who remixed it.
+          if (snap.parent_post_id && snap.postId) {
+            let parentUserKey = postIdToUserKey.get(snap.parent_post_id) || null;
+            let parentPost = parentUserKey && metrics.users[parentUserKey]?.posts?.[snap.parent_post_id]
+              ? metrics.users[parentUserKey].posts[snap.parent_post_id]
+              : null;
+            if (!parentPost) {
+              for (const [candidateUserKey, candidateUser] of Object.entries(metrics.users || {})) {
+                if (!candidateUser?.posts?.[snap.parent_post_id]) continue;
+                parentUserKey = candidateUserKey;
+                parentPost = candidateUser.posts[snap.parent_post_id];
+                postIdToUserKey.set(snap.parent_post_id, candidateUserKey);
+                break;
+              }
+            }
+            if (!parentPost) {
+              parentUserKey = userKey;
+              if (!metrics.users[parentUserKey]) {
+                metrics.users[parentUserKey] = { handle: null, id: null, posts: {}, followers: [], cameos: [] };
+              }
+              if (!metrics.users[parentUserKey].posts || typeof metrics.users[parentUserKey].posts !== 'object' || Array.isArray(metrics.users[parentUserKey].posts)) {
+                metrics.users[parentUserKey].posts = {};
+              }
+              parentPost = metrics.users[parentUserKey].posts[snap.parent_post_id] = { url: null, thumb: null, snapshots: [] };
+              postIdToUserKey.set(snap.parent_post_id, parentUserKey);
+              dirty = true;
+            }
+            const parentRemixPostIds = Array.isArray(parentPost.remix_post_ids) ? parentPost.remix_post_ids : [];
+            if (!parentRemixPostIds.includes(snap.postId)) {
+              parentPost.remix_post_ids = mergeRemixPostIds(parentRemixPostIds, [snap.postId]);
+              dirty = true;
+            }
+          }
 
           // IMPORTANT: Always update duration and dimensions at post level when available
           if (snap.duration != null) {
