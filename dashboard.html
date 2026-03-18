@@ -268,6 +268,47 @@
           </div>
         </div>
       </div>
+      <div id="mailboxActivityBlock" class="chart-block chart-block--mailbox-activity is-hidden">
+        <div class="chart-header">
+          <h4 class="chart-title">Mailbox Activity</h4>
+        </div>
+        <p class="section-note top-remixers-subtitle">Observed inbox like and comment notifications for the selected profile.</p>
+        <div class="top-remixers-panel">
+          <div id="mailboxActivityStats" class="top-remixers-meta">No mailbox activity for the selected profile.</div>
+          <div class="mailbox-activity-grid">
+            <div class="top-remixers-table-wrap">
+              <div class="mailbox-activity-card-title">Top Likers</div>
+              <table class="top-remixers-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>User</th>
+                    <th>Likes</th>
+                  </tr>
+                </thead>
+                <tbody id="topMailboxLikersBody">
+                  <tr class="top-remixers-empty"><td colspan="3">No likers captured yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="top-remixers-table-wrap">
+              <div class="mailbox-activity-card-title">Top Commenters</div>
+              <table class="top-remixers-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>User</th>
+                    <th>Comments</th>
+                  </tr>
+                </thead>
+                <tbody id="topMailboxCommentersBody">
+                  <tr class="top-remixers-empty"><td colspan="3">No commenters captured yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
       <div class="views-toggle">
         <div class="toggle-group toggle-group--lg" role="group" aria-label="View type">
           <button id="totalViewsPill" class="views-pill toggle-pill toggle-pill--lg active" data-type="total" aria-pressed="true">Total Views</button>

@@ -198,6 +198,7 @@ function buildExportHarness(metricsFixture, opts = {}) {
     __hydratedMetricsFixture: hydratedMetricsFixture,
     __hydrationCompletes: opts.hydrationCompletes !== false,
     __snapshotDebugEnabled: !!opts.snapshotDebugEnabled,
+    __mailboxOwnerKey: opts.mailboxOwnerKey || null,
     __throwOnAlert: opts.throwOnAlert !== false,
     __state: state,
     __latestSnapshot: latestSnapshot,
@@ -219,6 +220,7 @@ function buildExportHarness(metricsFixture, opts = {}) {
     let snapshotsHydratedForKey = null;
     let snapshotsHydrationEpoch = 1;
     let currentUserKey = 'h:test';
+    let mailboxOwnerKey = globalThis.__mailboxOwnerKey || null;
     const loadMetrics = async () => {
       metrics = globalThis.__loadedMetricsFixture;
       return metrics;
@@ -301,6 +303,7 @@ function buildImportHarness() {
   };
   const bootstrap = `
     const SITE_ORIGIN = 'https://sora.chatgpt.com';
+    const MAILBOX_OWNER_KEY_STORAGE_KEY = 'mailboxOwnerKey';
     const SNAP_DEBUG_ENABLED = false;
     const toTs = globalThis.__toTs;
     function isTopTodayKey(key) { return key === '__top_today__'; }
@@ -756,6 +759,19 @@ test('raw backup JSON survives export/import round-trip through dashboard backup
             discovery_phrase: 'delft pottery organ pug',
             cameo_usernames: ['bob', 'carol'],
             remix_post_ids: ['s_child_1', 's_child_2'],
+            mailbox_likes: [
+              { eventId: 'like_1:h:bob', actorKey: 'h:bob', actorHandle: 'bob', ts: 1773541500000 }
+            ],
+            mailbox_comments: [
+              { eventId: 'comment_1:h:carol', actorKey: 'h:carol', actorHandle: 'carol', ts: 1773541600000 }
+            ],
+            mailbox_remixes: [
+              { eventId: 'remix_1:h:dave', actorKey: 'h:dave', actorHandle: 'dave', ts: 1773541700000 }
+            ],
+            post_commenters: [
+              { eventId: 'commenter:h:carol', actorKey: 'h:carol', actorHandle: 'carol', ts: 1773541600000 },
+              { eventId: 'commenter:h:bob', actorKey: 'h:bob', actorHandle: 'bob', ts: 1773541500000 }
+            ],
             duration: 12.5,
             width: 1920,
             height: 1080,
@@ -770,7 +786,7 @@ test('raw backup JSON survives export/import round-trip through dashboard backup
     }
   };
 
-  const exportHarness = buildExportHarness(metricsFixture);
+  const exportHarness = buildExportHarness(metricsFixture, { mailboxOwnerKey: 'h:alice' });
   await exportHarness.exportRawBackupJSON();
   const json = exportHarness.state.blob.parts.join('');
 
@@ -791,17 +807,32 @@ test('raw backup JSON survives export/import round-trip through dashboard backup
 
   const didImport = await importHarness.importDataText(json, importedMetrics, stats);
   assert.equal(didImport, true);
+  assert.equal(JSON.parse(json).mailboxOwnerKey, 'h:alice');
   assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].cameo_usernames), ['bob', 'carol']);
   assert.equal(importedMetrics.users['h:alice'].posts['s_123'].duration, 12.5);
   assert.equal(importedMetrics.users['h:alice'].posts['s_123'].width, 1920);
   assert.equal(importedMetrics.users['h:alice'].posts['s_123'].height, 1080);
   assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].remix_post_ids), ['s_child_1', 's_child_2']);
+  assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].mailbox_likes), [
+    { eventId: 'like_1:h:bob', actorKey: 'h:bob', actorHandle: 'bob', actorId: null, ts: 1773541500000 }
+  ]);
+  assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].mailbox_comments), [
+    { eventId: 'comment_1:h:carol', actorKey: 'h:carol', actorHandle: 'carol', actorId: null, ts: 1773541600000 }
+  ]);
+  assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].mailbox_remixes), [
+    { eventId: 'remix_1:h:dave', actorKey: 'h:dave', actorHandle: 'dave', actorId: null, ts: 1773541700000 }
+  ]);
+  assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].post_commenters), [
+    { eventId: 'commenter:h:carol', actorKey: 'h:carol', actorHandle: 'carol', actorId: null, ts: 1773541600000 },
+    { eventId: 'commenter:h:bob', actorKey: 'h:bob', actorHandle: 'bob', actorId: null, ts: 1773541500000 }
+  ]);
   assert.deepEqual(
     toPlainJson(importedMetrics.users['h:alice'].posts['s_123'].snapshots.map((snap) => snap.t)),
     [1773541932509, 1773542932509]
   );
   assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].followers), [{ t: 1773541000000, count: 321 }]);
   assert.deepEqual(toPlainJson(importedMetrics.users['h:alice'].cameos), [{ t: 1773541000000, count: 12 }]);
+  assert.equal(stats.mailboxOwnerKey, 'h:alice');
 });
 
 test('raw backup JSON import backfills parent remix_post_ids from child parent_post_id links', async () => {

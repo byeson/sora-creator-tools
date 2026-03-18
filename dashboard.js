@@ -354,6 +354,7 @@
   const VIEWS_TYPE_STORAGE_KEY = 'SCT_DASHBOARD_VIEWS_TYPE_V1';
   const CHART_MODE_STORAGE_KEY = 'SCT_DASHBOARD_CHART_MODE_V1';
   const DISCOVERY_KEYWORD_VIZ_STORAGE_KEY = 'SCT_DASHBOARD_DISCOVERY_KEYWORD_VIZ_V1';
+  const MAILBOX_OWNER_KEY_STORAGE_KEY = 'mailboxOwnerKey';
   const STACKED_WINDOW_STORAGE_KEYS = {
     interaction: 'SCT_DASHBOARD_STACKED_WINDOW_INTERACTION_V1',
     views: 'SCT_DASHBOARD_STACKED_WINDOW_VIEWS_V1',
@@ -389,6 +390,7 @@
   let lastSessionCacheAt = 0;
   let currentUserKey = null;
   let lastSelectedUserKey = null;
+  let mailboxOwnerKey = null;
   let showDiscoveryPhrase = true;
   let nextAutoRefreshAt = 0;
   let autoRefreshCountdownTimer = null;
@@ -1978,6 +1980,70 @@
     }
     return merged;
   }
+  function dedupeCountSeriesByTimestamp(entries){
+    const byTs = new Map();
+    for (const entry of (Array.isArray(entries) ? entries : [])) {
+      if (!entry || typeof entry !== 'object') continue;
+      const t = toTs(entry.t);
+      const count = Number(entry.count);
+      if (!t || !Number.isFinite(count) || count < 0) continue;
+      const prev = byTs.get(t);
+      if (!prev || count > prev.count) byTs.set(t, { t, count });
+    }
+    return Array.from(byTs.values()).sort((a, b) => (a.t || 0) - (b.t || 0));
+  }
+  function scrubSuspiciousZeroCountSeries(entries){
+    const deduped = dedupeCountSeriesByTimestamp(entries);
+    if (!deduped.length) return { entries: [], removedCount: 0, changed: Array.isArray(entries) && entries.length > 0 };
+    const cleaned = [];
+    let removedCount = 0;
+    let seenPositive = false;
+    for (const entry of deduped) {
+      const count = Number(entry?.count);
+      if (count > 0) {
+        seenPositive = true;
+        cleaned.push(entry);
+        continue;
+      }
+      if (count === 0 && seenPositive) {
+        removedCount++;
+        continue;
+      }
+      cleaned.push(entry);
+    }
+    const changed = removedCount > 0
+      || deduped.length !== (Array.isArray(entries) ? entries.length : 0)
+      || deduped.some((entry, index) => {
+        const raw = Array.isArray(entries) ? entries[index] : null;
+        return !raw || toTs(raw.t) !== entry.t || Number(raw.count) !== entry.count;
+      });
+    return { entries: cleaned, removedCount, changed };
+  }
+  function scrubSuspiciousProfileSeriesInMetrics(metrics){
+    const stats = {
+      usersTouched: 0,
+      followersRemoved: 0,
+      cameosRemoved: 0
+    };
+    for (const user of Object.values(metrics?.users || {})) {
+      if (!user || typeof user !== 'object') continue;
+      let touched = false;
+      const followerResult = scrubSuspiciousZeroCountSeries(user.followers);
+      if (followerResult.changed) {
+        user.followers = followerResult.entries;
+        touched = true;
+      }
+      const cameoResult = scrubSuspiciousZeroCountSeries(user.cameos);
+      if (cameoResult.changed) {
+        user.cameos = cameoResult.entries;
+        touched = true;
+      }
+      stats.followersRemoved += followerResult.removedCount;
+      stats.cameosRemoved += cameoResult.removedCount;
+      if (touched) stats.usersTouched++;
+    }
+    return stats;
+  }
   function buildMergedIdentityUser(metrics, userKey, user = null){
     const resolvedUser = user || resolveUserForKey(metrics, userKey);
     if (!resolvedUser || isVirtualUserKey(userKey)) {
@@ -2051,6 +2117,18 @@
         }
         const mergedRemixPostIds = mergeRemixPostIds(merged.remix_post_ids, source.remix_post_ids);
         if (mergedRemixPostIds.length) merged.remix_post_ids = mergedRemixPostIds;
+        if (Array.isArray(source?.mailbox_likes) && source.mailbox_likes.length) {
+          merged.mailbox_likes = mergeMailboxActorEventsForDashboard(merged.mailbox_likes, source.mailbox_likes);
+        }
+        if (Array.isArray(source?.mailbox_comments) && source.mailbox_comments.length) {
+          merged.mailbox_comments = mergeMailboxActorEventsForDashboard(merged.mailbox_comments, source.mailbox_comments);
+        }
+        if (Array.isArray(source?.mailbox_remixes) && source.mailbox_remixes.length) {
+          merged.mailbox_remixes = mergeMailboxActorEventsForDashboard(merged.mailbox_remixes, source.mailbox_remixes);
+        }
+        if (Array.isArray(source?.post_commenters) && source.post_commenters.length) {
+          merged.post_commenters = mergeMailboxActorEventsForDashboard(merged.post_commenters, source.post_commenters);
+        }
       }
       mergedPosts[pid] = merged;
     }
@@ -2347,6 +2425,7 @@
   async function saveMetrics(nextMetrics, opts = {}){
     const metricsUpdatedAt = Date.now();
     const affectedUserKeys = opts.userKeys || Object.keys(nextMetrics.users || {});
+    const scrubStats = scrubSuspiciousProfileSeriesInMetrics(nextMetrics);
     const hotMetrics = { ...nextMetrics, users: { ...(nextMetrics?.users || {}) } };
     const shouldMergeExistingCold = true; // Always merge to prevent overwriting historical snapshots
     snapLog('saveMetrics:start', {
@@ -2355,6 +2434,7 @@
       shouldMergeExistingCold,
       snapshotsHydrated,
       isMetricsPartial,
+      scrubStats,
       inputSummary: summarizeMetricsSnapshots(nextMetrics)
     });
 
@@ -2498,7 +2578,8 @@
       currentUserKey
     });
     const perfGet = perfStart('storage.get metrics');
-    const { metrics = { users:{} }, metricsUpdatedAt } = await chrome.storage.local.get(['metrics', 'metricsUpdatedAt']);
+    const { metrics = { users:{} }, metricsUpdatedAt, [MAILBOX_OWNER_KEY_STORAGE_KEY]: storedMailboxOwnerKey } = await chrome.storage.local.get(['metrics', 'metricsUpdatedAt', MAILBOX_OWNER_KEY_STORAGE_KEY]);
+    mailboxOwnerKey = typeof storedMailboxOwnerKey === 'string' && storedMailboxOwnerKey ? storedMailboxOwnerKey : null;
     perfEnd(perfGet);
     if (metricsUpdatedAt != null) {
       const next = Number(metricsUpdatedAt);
@@ -2508,6 +2589,10 @@
       metricsUpdatedAt: Number(metricsUpdatedAt) || 0,
       summary: summarizeMetricsSnapshots(metrics)
     });
+    const scrubStats = scrubSuspiciousProfileSeriesInMetrics(metrics);
+    if (scrubStats.followersRemoved || scrubStats.cameosRemoved) {
+      snapLog('loadMetrics:scrubbedProfileSeries', scrubStats);
+    }
     if (SNAP_DEBUG_ENABLED && currentUserKey) {
       const storageUser = resolveUserForKey(metrics, currentUserKey);
       if (storageUser) {
@@ -2527,7 +2612,7 @@
     if (removed) {
       snapLog('loadMetrics:prunedEmptyUsers', { removed });
     }
-    if (removed) {
+    if (removed || scrubStats.usersTouched > 0) {
       const perfSet = perfStart('storage.set metrics');
       await saveMetrics(metrics, { userKeys: Object.keys(metrics.users || {}) });
       if (!lastMetricsUpdatedAt) {
@@ -3272,6 +3357,140 @@
     return out;
   }
 
+  function normalizeMailboxActorEvent(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const actorKey = typeof raw.actorKey === 'string' ? raw.actorKey.trim() : '';
+    if (!actorKey) return null;
+    const actorHandle = typeof raw.actorHandle === 'string' && raw.actorHandle.trim()
+      ? raw.actorHandle.trim()
+      : null;
+    const actorId = raw.actorId != null && String(raw.actorId).trim()
+      ? String(raw.actorId).trim()
+      : null;
+    const eventId = typeof raw.eventId === 'string' && raw.eventId.trim()
+      ? raw.eventId.trim()
+      : null;
+    const ts = toTs(raw.ts) || 0;
+    return {
+      actorKey,
+      actorHandle,
+      actorId,
+      eventId,
+      ts
+    };
+  }
+
+  function mergeMailboxActorEventsForDashboard(existing, incoming) {
+    const merged = new Map();
+    const mergeIn = (list) => {
+      for (const raw of Array.isArray(list) ? list : []) {
+        const event = normalizeMailboxActorEvent(raw);
+        if (!event) continue;
+        const dedupeKey = event.eventId || `${event.actorKey}:${event.ts || 0}`;
+        const prev = merged.get(dedupeKey);
+        if (!prev) {
+          merged.set(dedupeKey, { ...event });
+          continue;
+        }
+        merged.set(dedupeKey, {
+          ...prev,
+          ...event,
+          actorHandle: event.actorHandle || prev.actorHandle || null,
+          actorId: event.actorId || prev.actorId || null,
+          ts: Math.max(Number(prev.ts) || 0, Number(event.ts) || 0) || 0
+        });
+      }
+    };
+    mergeIn(existing);
+    mergeIn(incoming);
+    return Array.from(merged.values()).sort((a, b) => (Number(b?.ts) || 0) - (Number(a?.ts) || 0));
+  }
+
+  function formatMailboxActorLabel(actor) {
+    const handle = typeof actor?.actorHandle === 'string'
+      ? actor.actorHandle.trim().replace(/^@+/, '')
+      : '';
+    if (handle) return handle;
+    const actorKey = typeof actor?.actorKey === 'string' ? actor.actorKey : '';
+    if (actorKey.startsWith('h:')) return actorKey.slice(2);
+    if (actorKey.startsWith('id:')) return `User ${actorKey.slice(3)}`;
+    return actorKey || 'Unknown';
+  }
+
+  function userHasMailboxActivityData(user) {
+    const posts = (user && user.posts && typeof user.posts === 'object') ? user.posts : {};
+    for (const post of Object.values(posts)) {
+      if (!post || typeof post !== 'object') continue;
+      if (Array.isArray(post.mailbox_likes) && post.mailbox_likes.length) return true;
+      if (Array.isArray(post.mailbox_comments) && post.mailbox_comments.length) return true;
+    }
+    return false;
+  }
+
+  function shouldShowMailboxActivityForSelection(userKey, user) {
+    if (!userKey || !user) return false;
+    if (isVirtualUserKey(userKey)) return false;
+    if (userHasMailboxActivityData(user)) return true;
+    if (!mailboxOwnerKey) return true;
+    return areEquivalentUserKeys(metrics, userKey, mailboxOwnerKey);
+  }
+
+  function computeMailboxActivityInsights(user, visibleSet, limit = 20) {
+    const posts = (user && user.posts && typeof user.posts === 'object') ? user.posts : {};
+    const likeActors = new Map();
+    const commentActors = new Map();
+    let matchedPosts = 0;
+    let postsWithMailboxEvents = 0;
+    const consume = (bucket, list) => {
+      for (const event of mergeMailboxActorEventsForDashboard([], list)) {
+        const dedupeKey = event.eventId || `${event.actorKey || ''}:${toTs(event.ts) || 0}`;
+        if (!dedupeKey) continue;
+        bucket.set(dedupeKey, event);
+      }
+    };
+    for (const [pid, post] of Object.entries(posts)) {
+      if (visibleSet && typeof visibleSet.has === 'function' && !visibleSet.has(pid)) continue;
+      matchedPosts++;
+      const likeList = Array.isArray(post?.mailbox_likes) ? post.mailbox_likes : [];
+      const commentList = Array.isArray(post?.mailbox_comments) ? post.mailbox_comments : [];
+      if (likeList.length || commentList.length) postsWithMailboxEvents++;
+      consume(likeActors, likeList);
+      consume(commentActors, commentList);
+    }
+    const aggregate = (bucket) => {
+      const byActor = new Map();
+      for (const entry of bucket.values()) {
+        const actorKey = entry.actorKey || '';
+        if (!actorKey) continue;
+        const existing = byActor.get(actorKey) || {
+          actorKey,
+          actorHandle: entry.actorHandle || null,
+          actorId: entry.actorId ?? null,
+          count: 0,
+          lastTs: 0
+        };
+        existing.count += 1;
+        if (!existing.actorHandle && entry.actorHandle) existing.actorHandle = entry.actorHandle;
+        if (existing.actorId == null && entry.actorId != null) existing.actorId = entry.actorId;
+        existing.lastTs = Math.max(existing.lastTs || 0, entry.ts || 0);
+        byActor.set(actorKey, existing);
+      }
+      return Array.from(byActor.values()).sort((a, b) => {
+        const dc = (b.count || 0) - (a.count || 0);
+        if (dc !== 0) return dc;
+        const dt = (b.lastTs || 0) - (a.lastTs || 0);
+        if (dt !== 0) return dt;
+        return formatMailboxActorLabel(a).localeCompare(formatMailboxActorLabel(b));
+      }).slice(0, Math.max(1, Number(limit) || 20));
+    };
+    return {
+      matchedPosts,
+      postsWithMailboxEvents,
+      topLikers: aggregate(likeActors),
+      topCommenters: aggregate(commentActors)
+    };
+  }
+
   function buildParentRemixPostIndex(metrics) {
     const byParentPostId = new Map();
     for (const [userKey, user] of Object.entries(metrics?.users || {})) {
@@ -3318,6 +3537,23 @@
     if (ownerKey.startsWith('h:')) return ownerKey.slice(2);
     if (ownerKey.startsWith('id:')) return `User ${ownerKey.slice(3)}`;
     return ownerKey || 'Unknown';
+  }
+
+  function getProfileUrlForHandle(handle) {
+    const raw = String(handle || '').trim();
+    const candidate = raw.startsWith('h:') ? raw.slice(2) : raw;
+    if (raw.startsWith('id:')) return '';
+    const normalized = normalizeRemixOwnerHandle(candidate);
+    if (!normalized) return '';
+    return `https://sora.chatgpt.com/profile/${encodeURIComponent(normalized)}`;
+  }
+
+  function renderUserLabelCell(label, profileUrl) {
+    const safeLabel = esc(label || 'Unknown');
+    if (!profileUrl) {
+      return `<span class="top-remixers-user">${safeLabel}</span>`;
+    }
+    return `<a class="top-remixers-user-link" href="${esc(profileUrl)}" target="_blank" rel="noopener">${safeLabel}</a>`;
   }
 
   function createRemixLeaderboardContext(metrics) {
@@ -6540,6 +6776,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         format: 'sora-creator-tools/raw-backup-v1',
         exportedAt: new Date().toISOString(),
         snapshotsHydrated: !!snapshotsHydrated,
+        mailboxOwnerKey: mailboxOwnerKey || null,
         metrics: exportMetrics,
       };
       triggerDownload(
@@ -6971,6 +7208,14 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     }
     const nextRemixPostIds = mergeRemixPostIds(out.remix_post_ids, source.remix_post_ids);
     if (nextRemixPostIds.length) out.remix_post_ids = nextRemixPostIds;
+    const nextMailboxLikes = mergeMailboxActorEventsForDashboard(out.mailbox_likes, source.mailbox_likes);
+    if (nextMailboxLikes.length) out.mailbox_likes = nextMailboxLikes;
+    const nextMailboxComments = mergeMailboxActorEventsForDashboard(out.mailbox_comments, source.mailbox_comments);
+    if (nextMailboxComments.length) out.mailbox_comments = nextMailboxComments;
+    const nextMailboxRemixes = mergeMailboxActorEventsForDashboard(out.mailbox_remixes, source.mailbox_remixes);
+    if (nextMailboxRemixes.length) out.mailbox_remixes = nextMailboxRemixes;
+    const nextPostCommenters = mergeMailboxActorEventsForDashboard(out.post_commenters, source.post_commenters);
+    if (nextPostCommenters.length) out.post_commenters = nextPostCommenters;
     if (Number.isFinite(Number(source.duration))) out.duration = Number(source.duration);
     if (Number.isFinite(Number(source.width))) out.width = Number(source.width);
     if (Number.isFinite(Number(source.height))) out.height = Number(source.height);
@@ -7076,6 +7321,9 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     if (!importedMetrics) {
       throw new Error('Unsupported JSON import format. Expected a Sora Creator Tools full backup JSON file.');
     }
+    if (typeof parsed?.mailboxOwnerKey === 'string' && parsed.mailboxOwnerKey) {
+      stats.mailboxOwnerKey = parsed.mailboxOwnerKey;
+    }
 
     const importedUsers = importedMetrics.users && typeof importedMetrics.users === 'object' ? importedMetrics.users : {};
     const importedEntries = Object.entries(importedUsers);
@@ -7104,6 +7352,18 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           if (!rawPost || typeof rawPost !== 'object' || Array.isArray(rawPost)) continue;
           const nextPost = JSON.parse(JSON.stringify(rawPost));
           nextPost.snapshots = mergeSnapshotsByTimestamp([], rawPost.snapshots);
+          const nextMailboxLikes = mergeMailboxActorEventsForDashboard([], rawPost.mailbox_likes);
+          if (nextMailboxLikes.length) nextPost.mailbox_likes = nextMailboxLikes;
+          else delete nextPost.mailbox_likes;
+          const nextMailboxComments = mergeMailboxActorEventsForDashboard([], rawPost.mailbox_comments);
+          if (nextMailboxComments.length) nextPost.mailbox_comments = nextMailboxComments;
+          else delete nextPost.mailbox_comments;
+          const nextMailboxRemixes = mergeMailboxActorEventsForDashboard([], rawPost.mailbox_remixes);
+          if (nextMailboxRemixes.length) nextPost.mailbox_remixes = nextMailboxRemixes;
+          else delete nextPost.mailbox_remixes;
+          const nextPostCommenters = mergeMailboxActorEventsForDashboard([], rawPost.post_commenters);
+          if (nextPostCommenters.length) nextPost.post_commenters = nextPostCommenters;
+          else delete nextPost.post_commenters;
           if (nextPost.post_time) nextPost.post_time = toTs(nextPost.post_time) || nextPost.post_time;
           if (nextPost.lastSeen) nextPost.lastSeen = toTs(nextPost.lastSeen) || nextPost.lastSeen;
           nextUser.posts[postId] = nextPost;
@@ -7168,6 +7428,18 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           const nextRemixPostIds = mergeRemixPostIds([], rawPost.remix_post_ids);
           if (nextRemixPostIds.length) nextPost.remix_post_ids = nextRemixPostIds;
           else delete nextPost.remix_post_ids;
+          const nextMailboxLikes = mergeMailboxActorEventsForDashboard([], rawPost.mailbox_likes);
+          if (nextMailboxLikes.length) nextPost.mailbox_likes = nextMailboxLikes;
+          else delete nextPost.mailbox_likes;
+          const nextMailboxComments = mergeMailboxActorEventsForDashboard([], rawPost.mailbox_comments);
+          if (nextMailboxComments.length) nextPost.mailbox_comments = nextMailboxComments;
+          else delete nextPost.mailbox_comments;
+          const nextMailboxRemixes = mergeMailboxActorEventsForDashboard([], rawPost.mailbox_remixes);
+          if (nextMailboxRemixes.length) nextPost.mailbox_remixes = nextMailboxRemixes;
+          else delete nextPost.mailbox_remixes;
+          const nextPostCommenters = mergeMailboxActorEventsForDashboard([], rawPost.post_commenters);
+          if (nextPostCommenters.length) nextPost.post_commenters = nextPostCommenters;
+          else delete nextPost.post_commenters;
           if (nextPost.post_time) nextPost.post_time = toTs(nextPost.post_time) || nextPost.post_time;
           if (nextPost.lastSeen) nextPost.lastSeen = toTs(nextPost.lastSeen) || nextPost.lastSeen;
           user.posts[postId] = nextPost;
@@ -7193,6 +7465,14 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         }
         const nextRemixPostIds = mergeRemixPostIds(post.remix_post_ids, rawPost.remix_post_ids);
         if (nextRemixPostIds.length) post.remix_post_ids = nextRemixPostIds;
+        const nextMailboxLikes = mergeMailboxActorEventsForDashboard(post.mailbox_likes, rawPost.mailbox_likes);
+        if (nextMailboxLikes.length) post.mailbox_likes = nextMailboxLikes;
+        const nextMailboxComments = mergeMailboxActorEventsForDashboard(post.mailbox_comments, rawPost.mailbox_comments);
+        if (nextMailboxComments.length) post.mailbox_comments = nextMailboxComments;
+        const nextMailboxRemixes = mergeMailboxActorEventsForDashboard(post.mailbox_remixes, rawPost.mailbox_remixes);
+        if (nextMailboxRemixes.length) post.mailbox_remixes = nextMailboxRemixes;
+        const nextPostCommenters = mergeMailboxActorEventsForDashboard(post.post_commenters, rawPost.post_commenters);
+        if (nextPostCommenters.length) post.post_commenters = nextPostCommenters;
         if (Number.isFinite(Number(rawPost.duration))) post.duration = Number(rawPost.duration);
         if (Number.isFinite(Number(rawPost.width))) post.width = Number(rawPost.width);
         if (Number.isFinite(Number(rawPost.height))) post.height = Number(rawPost.height);
@@ -7298,7 +7578,8 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
         cameosAdded: 0,
         cameosSkipped: 0,
         usersAdded: 0,
-        usersUpdated: 0
+        usersUpdated: 0,
+        mailboxOwnerKey: null
       };
 
       let anyImported = false;
@@ -7314,6 +7595,12 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       }
 
       await saveMetrics(metrics, { userKeys: Object.keys(metrics.users || {}) });
+      if (typeof stats.mailboxOwnerKey === 'string' && stats.mailboxOwnerKey) {
+        mailboxOwnerKey = stats.mailboxOwnerKey;
+        try {
+          await chrome.storage.local.set({ [MAILBOX_OWNER_KEY_STORAGE_KEY]: mailboxOwnerKey });
+        } catch {}
+      }
 
       const message = `Import completed!\n\n` +
         `Posts: ${stats.postsAdded} added, ${stats.postsUpdated} updated\n` +
@@ -7760,6 +8047,10 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
     const discoveryKeywordsCloud = $('#discoveryKeywordsCloud');
     const topRemixersStats = $('#topRemixersStats');
     const topRemixersBody = $('#topRemixersBody');
+    const mailboxActivityBlock = $('#mailboxActivityBlock');
+    const mailboxActivityStats = $('#mailboxActivityStats');
+    const topMailboxLikersBody = $('#topMailboxLikersBody');
+    const topMailboxCommentersBody = $('#topMailboxCommentersBody');
     const PRESET_VISIBILITY_ACTIONS = new Set([
       'pastDay',
       'pastWeek',
@@ -10233,6 +10524,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       viewsPerMinuteTimeChart.setData([]);
       renderDiscoveryPhraseKeywords(null, null);
       renderTopRemixersPanel(null, null);
+      renderMailboxActivityPanel(null, null);
       return;
     }
         // No precompute needed for IR; use latest available remix count only for cards
@@ -10546,6 +10838,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
             refreshPerMinuteCharts(user, visibleSet);
             renderDiscoveryPhraseKeywords(user, visibleSet);
             renderTopRemixersPanel(user, visibleSet);
+            renderMailboxActivityPanel(user, visibleSet);
             // Only update compare charts if no compare users are selected
             if (compareUsers.size === 0){
               // Update unfiltered totals cards for single user
@@ -11309,10 +11602,58 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       topRemixersBody.innerHTML = stats.rows.map((row, index) => `
         <tr>
           <td>${index + 1}</td>
-          <td><span class="top-remixers-user">${esc(getTopRemixerLabel(row))}</span></td>
+          <td>${renderUserLabelCell(getTopRemixerLabel(row), getProfileUrlForHandle(row.ownerHandle))}</td>
           <td>${fmt(row.count)}</td>
         </tr>
       `).join('');
+    }
+
+    function renderMailboxActivityRows(bodyEl, rows, valueLabel) {
+      if (!bodyEl) return;
+      if (!rows.length) {
+        bodyEl.innerHTML = `<tr class="top-remixers-empty"><td colspan="3">No ${valueLabel.toLowerCase()} captured yet.</td></tr>`;
+        return;
+      }
+      bodyEl.innerHTML = rows.map((row, index) => `
+        <tr>
+          <td>${index + 1}</td>
+          <td>${renderUserLabelCell(formatMailboxActorLabel(row), getProfileUrlForHandle(row.actorHandle || row.actorKey))}</td>
+          <td>${fmt(row.count)}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderMailboxActivityPanel(user, visibleSet) {
+      if (!mailboxActivityBlock || !mailboxActivityStats || !topMailboxLikersBody || !topMailboxCommentersBody) return;
+      const shouldShow = shouldShowMailboxActivityForSelection(currentUserKey, user);
+      mailboxActivityBlock.classList.toggle('is-hidden', !shouldShow);
+      if (!shouldShow) return;
+      const insights = computeMailboxActivityInsights(user, visibleSet, 15);
+      const hasStoredMailboxData = userHasMailboxActivityData(user);
+      if (!insights.matchedPosts) {
+        mailboxActivityStats.textContent = 'No visible posts selected yet.';
+        renderMailboxActivityRows(topMailboxLikersBody, [], 'Likes');
+        renderMailboxActivityRows(topMailboxCommentersBody, [], 'Comments');
+        return;
+      }
+      if (!hasStoredMailboxData) {
+        mailboxActivityStats.textContent = mailboxOwnerKey
+          ? 'No mailbox activity captured for the currently visible posts yet.'
+          : 'Open Sora inbox/notifications once in this browser profile to capture mailbox activity.';
+        renderMailboxActivityRows(topMailboxLikersBody, [], 'Likes');
+        renderMailboxActivityRows(topMailboxCommentersBody, [], 'Comments');
+        return;
+      }
+      if (!insights.postsWithMailboxEvents) {
+        mailboxActivityStats.textContent = 'No mailbox activity found for the current post filter.';
+        renderMailboxActivityRows(topMailboxLikersBody, [], 'Likes');
+        renderMailboxActivityRows(topMailboxCommentersBody, [], 'Comments');
+        return;
+      }
+      mailboxActivityStats.textContent =
+        `${fmt(insights.topLikers.length)} likers • ${fmt(insights.topCommenters.length)} commenters across ${fmt(insights.postsWithMailboxEvents)} visible posts with inbox activity.`;
+      renderMailboxActivityRows(topMailboxLikersBody, insights.topLikers, 'Likes');
+      renderMailboxActivityRows(topMailboxCommentersBody, insights.topCommenters, 'Comments');
     }
 
     function setDiscoveryKeywordVizMode(mode, opts = {}){

@@ -16,6 +16,8 @@
   const MAX_REQUEST_ID_LEN = 80;
   const MAX_CAMEO_USERNAMES = 32;
   const MAX_REMIX_POST_IDS_PER_POST = 300;
+  const MAX_MAILBOX_EVENTS_PER_POST = 200;
+  const MAX_EVENT_ID_LEN = 256;
 
   function sanitizeString(value, maxLen = MAX_STR_LEN) {
     if (typeof value !== 'string') return null;
@@ -69,6 +71,40 @@
     return out.length ? out : null;
   }
 
+  function sanitizeMailboxActorEvent(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const actorHandle = sanitizeString(raw.actorHandle, MAX_HANDLE_LEN);
+    const actorId = sanitizeUserId(raw.actorId);
+    let actorKey = sanitizeIdToken(raw.actorKey);
+    if (!actorKey && actorHandle) actorKey = `h:${actorHandle.toLowerCase()}`;
+    if (!actorKey && actorId != null) actorKey = `id:${String(actorId)}`;
+    if (!actorKey) return null;
+    const eventId = sanitizeIdToken(raw.eventId, MAX_EVENT_ID_LEN);
+    const ts = sanitizeNumber(raw.ts, 0);
+    const out = { actorKey };
+    if (actorHandle) out.actorHandle = actorHandle;
+    if (actorId != null) out.actorId = actorId;
+    if (eventId) out.eventId = eventId;
+    if (ts != null) out.ts = ts;
+    return out;
+  }
+
+  function sanitizeMailboxActorEvents(value) {
+    if (!Array.isArray(value)) return null;
+    const out = [];
+    const seen = new Set();
+    for (const raw of value) {
+      if (out.length >= MAX_MAILBOX_EVENTS_PER_POST) break;
+      const event = sanitizeMailboxActorEvent(raw);
+      if (!event) continue;
+      const dedupeKey = event.eventId || `${event.actorKey}:${event.ts || 0}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      out.push(event);
+    }
+    return out.length ? out : null;
+  }
+
   function sanitizeMetricsItem(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const item = {};
@@ -117,6 +153,14 @@
     if (cameoUsernames) item.cameo_usernames = cameoUsernames;
     const remixPostIds = sanitizeRemixPostIds(raw.remix_post_ids);
     if (remixPostIds) item.remix_post_ids = remixPostIds;
+    const mailboxLikes = sanitizeMailboxActorEvents(raw.mailbox_likes);
+    if (mailboxLikes) item.mailbox_likes = mailboxLikes;
+    const mailboxComments = sanitizeMailboxActorEvents(raw.mailbox_comments);
+    if (mailboxComments) item.mailbox_comments = mailboxComments;
+    const mailboxRemixes = sanitizeMailboxActorEvents(raw.mailbox_remixes);
+    if (mailboxRemixes) item.mailbox_remixes = mailboxRemixes;
+    const postCommenters = sanitizeMailboxActorEvents(raw.post_commenters);
+    if (postCommenters) item.post_commenters = postCommenters;
 
     const uv = sanitizeNumber(raw.uv, 0);
     if (uv != null) item.uv = uv;
@@ -351,6 +395,19 @@
     if (!items.length) return;
     try {
       chrome.runtime.sendMessage({ action: 'metrics_batch', items });
+    } catch {}
+  });
+
+  window.addEventListener('message', function(ev) {
+    if (ev?.source !== window) return;
+    const d = ev?.data;
+    if (!d || d.__sora_uv__ !== true || d.type !== 'mailbox_owner') return;
+    const userHandle = sanitizeString(d.userHandle, MAX_HANDLE_LEN);
+    const providedUserKey = sanitizeIdToken(d.userKey);
+    const userKey = providedUserKey || (userHandle ? `h:${userHandle.toLowerCase()}` : null);
+    if (!userKey) return;
+    try {
+      chrome.runtime.sendMessage({ action: 'mailbox_owner', userKey, userHandle });
     } catch {}
   });
 

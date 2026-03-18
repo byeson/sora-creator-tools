@@ -45,7 +45,7 @@ function buildBackgroundSanitizerHarness() {
   const context = {};
   vm.createContext(context);
   vm.runInContext(
-    `const MAX_REMIX_POST_IDS_PER_POST = 300;\n${snippet}\nglobalThis.__sanitizeMetricsSnapshot = sanitizeMetricsSnapshot;`,
+    `const MAX_REMIX_POST_IDS_PER_POST = 300;\nconst MAX_MAILBOX_EVENTS_PER_POST = 200;\nconst MAX_EVENT_ID_LEN = 256;\n${snippet}\nglobalThis.__sanitizeMetricsSnapshot = sanitizeMetricsSnapshot;`,
     context,
     { filename: 'background-sanitize-metrics-snapshot.harness.js' }
   );
@@ -185,4 +185,26 @@ test('sanitizers drop malformed remix post ids but keep the post payload', () =>
   assert.ok(backgroundOut);
   assert.deepEqual(Array.from(contentOut.remix_post_ids), ['s_child_a', 's_child_b']);
   assert.deepEqual(Array.from(backgroundOut.remix_post_ids), ['s_child_a', 's_child_b']);
+});
+
+test('sanitizers preserve deduped mailbox actor events when a post signal is present', () => {
+  const sanitizeMetricsItem = buildContentSanitizerHarness();
+  const sanitizeMetricsSnapshot = buildBackgroundSanitizerHarness();
+  const payload = {
+    userKey: 'h:alice.sora',
+    postId: 's_parent',
+    mailbox_likes: [
+      { eventId: 'evt_like_1:h:bob', actorKey: 'h:bob', actorHandle: 'bob', ts: 1000 },
+      { eventId: 'evt_like_1:h:bob', actorKey: 'h:bob', actorHandle: 'bob', ts: 1000 },
+      { eventId: 'evt_like_2:h:carol', actorKey: 'h:carol', actorHandle: 'carol', ts: 2000 }
+    ]
+  };
+
+  const contentOut = sanitizeMetricsItem(payload);
+  const backgroundOut = sanitizeMetricsSnapshot(payload);
+
+  assert.ok(contentOut);
+  assert.ok(backgroundOut);
+  assert.deepEqual(Array.from(contentOut.mailbox_likes).map((event) => event.actorKey), ['h:bob', 'h:carol']);
+  assert.deepEqual(Array.from(backgroundOut.mailbox_likes).map((event) => event.actorKey), ['h:bob', 'h:carol']);
 });
