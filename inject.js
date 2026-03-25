@@ -77,6 +77,7 @@
   const idToDimensions = new Map(); // Video dimensions { width, height }
   const idToPrompt = new Map(); // Draft prompt text
   const idToDownloadUrl = new Map(); // Draft downloadable URL
+  const idToVideoUrl = new Map(); // Feed post video URL (encodings.source.path)
   const idToViolation = new Map(); // Draft content violation status
   const idToRemixTarget = new Map(); // Draft remix target post ID (if it's a remix of a post)
   const idToRemixTargetDraft = new Map(); // Draft remix target draft ID (if it's a remix of a draft)
@@ -5812,7 +5813,9 @@ async function renderAnalyzeTable(force = false) {
           if (att?.n_frames != null) nFrames = Number(att.n_frames);
           if (att?.width != null) width = Number(att.width);
           if (att?.height != null) height = Number(att.height);
-          
+          const videoPath = att?.encodings?.source?.path;
+          if (typeof videoPath === 'string' && videoPath) idToVideoUrl.set(id, videoPath);
+
           if (DEBUG.feed && nFrames == null) {
              dlog('feed', 'attachments found but n_frames missing', { id, attKeys: Object.keys(att) });
           }
@@ -5932,9 +5935,10 @@ async function renderAnalyzeTable(force = false) {
       const userKey = userHandle ? `h:${userHandle.toLowerCase()}` : userId != null ? `id:${userId}` : pageUserKey;
       const followers = getFollowerCount(it);
 
-      // Get duration and dimensions that were just extracted above
+      // Get duration, dimensions, and video URL that were just extracted above
       const duration = idToDuration.get(id);
       const dimensions = idToDimensions.get(id);
+      const videoUrl = idToVideoUrl.get(id) || null;
 
       batch.push({
         postId: id,
@@ -5952,6 +5956,7 @@ async function renderAnalyzeTable(force = false) {
         ageMin,
         thumb: th,
         url: absUrl,
+        video_url: videoUrl,
         ts: Date.now(),
         userHandle,
         userId,

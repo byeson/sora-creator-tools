@@ -93,6 +93,8 @@
     if (url) item.url = url;
     const thumb = sanitizeString(raw.thumb, MAX_URL_LEN);
     if (thumb) item.thumb = thumb;
+    const videoUrl = sanitizeString(raw.video_url, MAX_URL_LEN);
+    if (videoUrl) item.video_url = videoUrl;
     const caption = sanitizeString(raw.caption, MAX_STR_LEN);
     if (caption) item.caption = caption;
 

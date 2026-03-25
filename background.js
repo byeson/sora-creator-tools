@@ -121,6 +121,8 @@ function sanitizeMetricsSnapshot(raw) {
   if (url) snap.url = url;
   const thumb = sanitizeString(raw.thumb, 2048);
   if (thumb) snap.thumb = thumb;
+  const videoUrl = sanitizeString(raw.video_url, 2048);
+  if (videoUrl) snap.video_url = videoUrl;
   const caption = sanitizeString(raw.caption, 4096);
   if (caption) snap.caption = caption;
 
@@ -375,6 +377,7 @@ function trimPostForResponse(post, snapshotMode) {
   return {
     url: post.url ?? null,
     thumb: post.thumb ?? null,
+    video_url: post.video_url ?? null,
     caption: typeof post.caption === 'string' ? post.caption : null,
     text: typeof post.text === 'string' ? post.text : null,
     ownerKey: post.ownerKey ?? null,
@@ -538,13 +541,14 @@ async function flush() {
           if (!userEntry.posts[snap.postId]) {
             dirty = true;
           }
-          const post = userEntry.posts[snap.postId] || (userEntry.posts[snap.postId] = { url: snap.url || null, thumb: snap.thumb || null, snapshots: [] });
+          const post = userEntry.posts[snap.postId] || (userEntry.posts[snap.postId] = { url: snap.url || null, thumb: snap.thumb || null, video_url: snap.video_url || null, snapshots: [] });
           touchedPosts.add(post);
           // Persist owner attribution on the post to allow dashboard integrity checks
           if (!post.ownerKey && (snap.userKey || snap.pageUserKey)) { post.ownerKey = snap.userKey || snap.pageUserKey; dirty = true; }
           if (!post.ownerHandle && (snap.userHandle || snap.pageUserHandle)) { post.ownerHandle = snap.userHandle || snap.pageUserHandle; dirty = true; }
           if (!post.ownerId && snap.userId != null) { post.ownerId = snap.userId; dirty = true; }
           if (!post.url && snap.url) { post.url = snap.url; dirty = true; }
+          if (!post.video_url && snap.video_url) { post.video_url = snap.video_url; dirty = true; }
           // Capture/refresh caption
           if (typeof snap.caption === 'string' && snap.caption) {
             if (!post.caption) { post.caption = snap.caption; dirty = true; }

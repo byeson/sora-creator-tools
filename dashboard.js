@@ -6106,7 +6106,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
       const postsHeader = [
         'User Key', 'User Handle', 'User ID', 
         'Post ID', 'Post URL', 'Post Time', 'Post Time (ISO)', 'Caption',
-        'Thumbnail URL', 'Parent Post ID', 'Root Post ID', 'Last Seen Timestamp',
+        'Thumbnail URL', 'Video URL', 'Parent Post ID', 'Root Post ID', 'Last Seen Timestamp',
         'Owner Key', 'Owner Handle', 'Owner ID',
         'Latest Snapshot Timestamp', 'Unique Views', 'Total Views', 'Likes', 'Comments', 'Remixes',
         'Interaction Rate %', 'Remix Rate %', 'Like Rate %',
@@ -6138,6 +6138,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           
           const caption = (typeof post.caption === 'string' && post.caption) ? post.caption.replace(/\n/g, ' ').replace(/\r/g, '') : '';
           const thumb = post.thumb || '';
+          const videoUrl = post.video_url || '';
           const url = post.url || `${SITE_ORIGIN}/p/${pid}`;
           const ownerKey = post.ownerKey || userKey;
           const ownerHandle = post.ownerHandle || handle;
@@ -6154,7 +6155,7 @@ function makeTimeChart(canvas, tooltipSelector = '#viewsTooltip', yAxisLabel = '
           allLines.push([
             userKey, handle, userId,
             pid, url, postTime, postTimeISO, caption,
-            thumb, parentPostId, rootPostId, lastSeen,
+            thumb, videoUrl, parentPostId, rootPostId, lastSeen,
             ownerKey, ownerHandle, ownerId,
             latestTime, uv, views, likes, comments, remixes,
             ir != null ? ir.toFixed(2) : '', rr != null ? rr : '', lr != null ? lr.toFixed(2) : '',
